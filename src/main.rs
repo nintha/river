@@ -15,7 +15,7 @@ use futures::sink::SinkExt;
 use std::sync::Arc;
 use std::collections::hash_map::{Entry, HashMap};
 use crate::extension::{TcpStreamExtend, print_hex};
-use crate::packet::{Handshake0, Handshake1, Handshake2, calc_amf_byte_len, read_all_amf_value};
+use crate::packet::{Handshake0, Handshake1, Handshake2, calc_amf_byte_len, read_all_amf_value, ChunkMessage, ChunkContext};
 use byteorder::{BigEndian, ByteOrder};
 use rand::Rng;
 use std::time::{SystemTime, Instant};
@@ -24,8 +24,6 @@ use amf::Pair;
 use std::io::Write;
 
 pub type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-type Sender<T> = mpsc::UnboundedSender<T>;
-type Receiver<T> = mpsc::UnboundedReceiver<T>;
 
 fn init_logger() {
     use chrono::Local;
@@ -85,6 +83,13 @@ async fn accept_loop(addr: &str) -> BoxResult<()> {
 
 async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     let zero_time = Local::now().timestamp_millis();
+    let mut ctx = ChunkContext {
+        last_timestamp_delta: 0,
+        last_timestamp: 0,
+        last_message_length: 0,
+        last_message_type_id: 0,
+        last_message_stream_id: 0,
+    };
     /* C0/S0 */
     let c0 = stream.read_one_return().await?;
     log::info!("C0, version={}", c0);
@@ -162,9 +167,8 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     }
 
     {
-        let ack = stream.read_exact_return(12).await?;
-        log::info!("C->S, ack:");
-        print_hex(ack.as_ref());
+        let chunk_message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, ack: {:?}", chunk_message);
     }
 
     {
@@ -212,77 +216,36 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     }
 
     {
-        let one = stream.read_one_return().await?;
-        let fmt = one >> 6;
-        let csid = one << 2 >> 2;
-        let len = match fmt {
-            0 => {
-                let h = stream.read_exact_return(11).await?;
-                log::info!("C->S, releaseStream header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, releaseStream header: {:?}, type: {:?}", &message.header, message.message_type_desc());
+        if let Some(values) = message.try_read_body_to_amf0() {
+            for v in values {
+                log::info!("C->S, releaseStream part: {:?}", v);
             }
-            1 => {
-                let h = stream.read_exact_return(7).await?;
-                log::info!("C->S, releaseStream header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
-            }
-            _ => unimplemented!()
-        };
-        let body = stream.read_exact_return(len).await?;
-        log::info!("C->S, releaseStream body:");
-        print_hex(body.as_ref());
+        }
     }
 
     {
-        let one = stream.read_one_return().await?;
-        let fmt = one >> 6;
-        let csid = one << 2 >> 2;
-        let len = match fmt {
-            0 => {
-                let h = stream.read_exact_return(11).await?;
-                log::info!("C->S, FCPublish header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, FCPublish header: {:?}, type: {:?}", &message.header, message.message_type_desc());
+        if let Some(values) = message.try_read_body_to_amf0() {
+            for v in values {
+                log::info!("C->S, FCPublish part: {:?}", v);
             }
-            1 => {
-                let h = stream.read_exact_return(7).await?;
-                log::info!("C->S, FCPublish header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
-            }
-            _ => unimplemented!()
-        };
-        let body = stream.read_exact_return(len).await?;
-        log::info!("C->S, FCPublish body:");
-        print_hex(body.as_ref());
+        }
     }
 
-    let create_stream_body= {
-        let one = stream.read_one_return().await?;
-        let fmt = one >> 6;
-        let csid = one << 2 >> 2;
-        let len = match fmt {
-            0 => {
-                let h = stream.read_exact_return(11).await?;
-                log::info!("C->S, createStream header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
+    let create_stream_body = {
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, createStream header: {:?}, type: {:?}", &message.header, message.message_type_desc());
+        if let Some(values) = message.try_read_body_to_amf0() {
+            for v in &values {
+                log::info!("C->S, createStream part: {:?}", v);
             }
-            1 => {
-                let h = stream.read_exact_return(7).await?;
-                log::info!("C->S, createStream header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
-            }
-            _ => unimplemented!()
-        };
-        let body = stream.read_exact_return(len).await?;
-        log::info!("C->S, createStream body:");
-        print_hex(body.as_ref());
-
-        read_all_amf_value(&body)
+            values
+        }else{
+            Err("can't parse createStream message")?
+        }
     };
 
     {
@@ -298,29 +261,12 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     }
 
     {
-        let one = stream.read_one_return().await?;
-        let fmt = one >> 6;
-        let csid = one << 2 >> 2;
-        let len = match fmt {
-            0 => {
-                let h = stream.read_exact_return(11).await?;
-                log::info!("C->S, publish header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, publish header: {:?}, type: {:?}", &message.header, message.message_type_desc());
+        if let Some(values) = message.try_read_body_to_amf0() {
+            for v in values {
+                log::info!("C->S, publish part: {:?}", v);
             }
-            1 => {
-                let h = stream.read_exact_return(7).await?;
-                log::info!("C->S, publish header:");
-                print_hex(&h);
-                BigEndian::read_u24(&h[3..6])
-            }
-            _ => unimplemented!()
-        };
-        let body = stream.read_exact_return(len).await?;
-
-        let values = read_all_amf_value(&body);
-        for v in values {
-            log::info!("C->S, publish part: {:?}", v);
         }
     };
 
@@ -357,18 +303,18 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     let mut arr: [char; 8] = ['.'; 8];
     loop {
         let byte = stream.read_one_return().await?;
-        print!("{:#04X}", byte);
-        if byte.is_ascii_graphic() {
-            arr[i % 8] = byte as char;
-        } else {
-            arr[i % 8] = '.';
-        }
-        print!(" ");
-        std::io::stdout().flush()?;
-        i += 1;
-        if i % 8 == 0 {
-            println!("  {}", arr.iter().collect::<String>());
-        }
+        // print!("{:#04X}", byte);
+        // if byte.is_ascii_graphic() {
+        //     arr[i % 8] = byte as char;
+        // } else {
+        //     arr[i % 8] = '.';
+        // }
+        // print!(" ");
+        // std::io::stdout().flush()?;
+        // i += 1;
+        // if i % 8 == 0 {
+        //     println!("  {}", arr.iter().collect::<String>());
+        // }
     }
 
     Ok(())

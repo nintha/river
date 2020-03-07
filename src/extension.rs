@@ -27,26 +27,32 @@ impl TcpStreamExtend for TcpStream {
     }
 }
 
-pub fn print_hex(bytes: &[u8]) {
+pub fn bytes_hex_format(bytes: &[u8]) -> String {
+    let mut text = String::new();
     let mut i = 0;
     let mut arr: [char; 8] = ['.'; 8];
     for byte in bytes {
-        print!("{:#04X}", byte);
+        text += &format!("{:#04X}", byte);
         if byte.is_ascii_graphic() {
             arr[i % 8] = byte.clone() as char;
         } else {
             arr[i % 8] = '.';
         }
-        print!(" ");
+        text += &format!(" ");
         i += 1;
         if i % 8 == 0 {
-            println!("  {}", arr.iter().collect::<String>());
+            text += &format!("  {}\n", arr.iter().collect::<String>());
         }
     }
     if i % 8 > 0 {
         for _ in 0..(7 - (i - 1) % 8) {
-            print!("     ");
+            text += "     ";
         }
-        println!("  {}", arr.iter().take(((i -1) % 8) + 1 ).collect::<String>());
+        text += &format!("  {}\n", arr.iter().take(((i - 1) % 8) + 1).collect::<String>());
     }
+    text
+}
+
+pub fn print_hex(bytes: &[u8]) {
+    println!("{}", bytes_hex_format(bytes));
 }

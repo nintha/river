@@ -5,7 +5,8 @@ use amf::amf0;
 use amf::amf0::Value;
 use async_std::net::TcpStream;
 use crate::BoxResult;
-use crate::extension::TcpStreamExtend;
+use crate::extension::{TcpStreamExtend, bytes_hex_format};
+use std::fmt::{Debug, Formatter, Error};
 
 
 #[derive(Clone, Debug)]
@@ -88,7 +89,7 @@ impl Handshake2 {
     }
 }
 
-pub enum ChunkMessageHeader {
+pub enum ChunkMessageHeaderType {
     /// Type 0 chunk headers are 11 bytes long. This type MUST be used at
     /// the start of a chunk stream, and whenever the stream timestamp goes
     /// backward (e.g., because of a backward seek)
@@ -145,60 +146,120 @@ pub enum ChunkMessageHeader {
     Type3,
 }
 
-impl ChunkMessageHeader {
 
-    /// return csid and header
-    ///
-    /// TODO 处理extended timestamp
-    pub async fn read_from(stream: &mut TcpStream) -> BoxResult<(u32, Self)> {
+pub struct ChunkContext {
+    pub last_timestamp: u32,
+    pub last_timestamp_delta: u32,
+    pub last_message_length: u32,
+    pub last_message_type_id: u8,
+    pub last_message_stream_id: u32,
+}
+
+#[derive(Debug)]
+pub struct ChunkMessageHeader {
+    pub chunk_stream_id: u32,
+    pub timestamp: u32,
+    pub message_length: u32,
+    pub message_type_id: u8,
+    pub message_stream_id: u32,
+}
+
+pub struct ChunkMessage {
+    pub header: ChunkMessageHeader,
+    pub message_data: Vec<u8>,
+}
+
+
+impl ChunkMessage {
+    pub async fn read_from(stream: &mut TcpStream, ctx: &mut ChunkContext) -> BoxResult<Self> {
         let one = stream.read_one_return().await?;
         let fmt = one >> 6;
         let csid = one << 2 >> 2;
-        let header = match fmt {
+        let (timestamp, message_length, message_type_id, message_stream_id) = match fmt {
             0 => {
                 let h = stream.read_exact_return(11).await?;
-                ChunkMessageHeader::Type0 {
-                    timestamp: BigEndian::read_u24(&h[0..3]),
-                    message_length: BigEndian::read_u24(&h[3..6]),
-                    message_type_id: h[6],
-                    message_stream_id: BigEndian::read_u32(&h[7..11]),
-                }
+                (BigEndian::read_u24(&h[0..3]),
+                 BigEndian::read_u24(&h[3..6]),
+                 h[6],
+                 BigEndian::read_u32(&h[7..11]))
             }
             1 => {
                 let h = stream.read_exact_return(7).await?;
-                ChunkMessageHeader::Type1 {
-                    timestamp_delta: BigEndian::read_u24(&h[0..3]),
-                    message_length: BigEndian::read_u24(&h[3..6]),
-                    message_type_id: h[6],
-                }
+                let timestamp_delta = BigEndian::read_u24(&h[0..3]);
+                ctx.last_timestamp = timestamp_delta;
+                (ctx.last_timestamp + timestamp_delta,
+                 BigEndian::read_u24(&h[3..6]),
+                 h[6],
+                 ctx.last_message_stream_id)
             }
             2 => {
                 let h = stream.read_exact_return(3).await?;
-                ChunkMessageHeader::Type2 {
-                    timestamp_delta: BigEndian::read_u24(&h[0..3]),
-                }
+                (ctx.last_timestamp + BigEndian::read_u24(&h[0..3]),
+                 ctx.last_message_length,
+                 ctx.last_message_type_id,
+                 ctx.last_message_stream_id)
             }
-            3 => ChunkMessageHeader::Type3,
+            3 => {
+                (ctx.last_timestamp + ctx.last_timestamp_delta,
+                 ctx.last_message_length,
+                 ctx.last_message_type_id,
+                 ctx.last_message_stream_id)
+            }
             _ => unreachable!()
         };
-        Ok((csid as u32, header))
+        let message_data = stream.read_exact_return(message_length).await?;
+
+        Ok(ChunkMessage {
+            header: ChunkMessageHeader {
+                chunk_stream_id: csid as u32,
+                message_stream_id,
+                message_length,
+                timestamp,
+                message_type_id,
+            },
+            message_data,
+        })
+    }
+
+    pub fn message_type_desc(&self) -> String {
+        match self.header.message_type_id {
+            1 => "ProtocolControlMessages::SetChunkSize".into(),
+            2 => "ProtocolControlMessages::AbortMessage".into(),
+            3 => "ProtocolControlMessages::Acknowledgement".into(),
+            4 => "ProtocolControlMessages::UserControlMessage".into(),
+            5 => "ProtocolControlMessages::WindowAcknowledgementSize".into(),
+            6 => "ProtocolControlMessages::SetPeerBandwidth".into(),
+            17 => "CommandMessages::AMF3CommandMessage".into(),
+            20 => "CommandMessages::AMF0CommandMessage".into(),
+            15 => "CommandMessages::AMF3DataMessage".into(),
+            18 => "CommandMessages::AMF0DataMessage".into(),
+            16 => "CommandMessages::AMF3SharedObjectMessage".into(),
+            19 => "CommandMessages::AMF0SharedObjectMessage".into(),
+            8 => "CommandMessages::AudioMessage".into(),
+            9 => "CommandMessages::VideoMessage".into(),
+            22 => "CommandMessages::AggregateMessage".into(),
+            _ => "UnknownMessage".into(),
+        }
+    }
+
+    /// 把body数据解析成amf0格式
+    pub fn try_read_body_to_amf0(&self) -> Option<Vec<Value>> {
+        if self.header.message_type_id == 20 {
+            Some(read_all_amf_value(&self.message_data))
+        } else {
+            None
+        }
     }
 }
 
-
-pub struct ChunkMessage {
-    pub chunk_stream_id: u32,
-    pub chunk_message_header: ChunkMessageHeader,
-    pub chunk_data: Vec<u8>,
+impl Debug for ChunkMessage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ChunkMessage {{\nheader: {:?}\nmessage type: {}\nbody:\n{}}}",
+               self.header,
+               self.message_type_desc(),
+               bytes_hex_format(&self.message_data))
+    }
 }
-
-
-// impl ChunkMessage {
-//     pub fn read_from(&mut stream: TcpStream) -> BoxResult<Self> {
-//         let (csid, header) = ChunkMessageHeader::read_from(stream)?;
-//
-//     }
-// }
 
 pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
     match v {
