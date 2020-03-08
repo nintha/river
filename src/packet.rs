@@ -153,6 +153,22 @@ pub struct ChunkContext {
     pub last_message_length: u32,
     pub last_message_type_id: u8,
     pub last_message_stream_id: u32,
+    pub chunk_size: u32,
+    pub remain_message_length: u32,
+}
+
+impl ChunkContext {
+    pub fn new() -> Self {
+        ChunkContext {
+            last_timestamp_delta: 0,
+            last_timestamp: 0,
+            last_message_length: 0,
+            last_message_type_id: 0,
+            last_message_stream_id: 0,
+            chunk_size: 128,
+            remain_message_length: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -169,45 +185,83 @@ pub struct ChunkMessage {
     pub message_data: Vec<u8>,
 }
 
-
 impl ChunkMessage {
     pub async fn read_from(stream: &mut TcpStream, ctx: &mut ChunkContext) -> BoxResult<Self> {
+        let mut chunk = ChunkMessage::read_one_from(stream, ctx).await?;
+        while ctx.remain_message_length > 0 {
+            let mut remain_chunk = ChunkMessage::read_one_from(stream, ctx).await?;
+            chunk.message_data.append(&mut remain_chunk.message_data);
+        }
+
+        Ok(chunk)
+    }
+
+    pub async fn read_one_from(stream: &mut TcpStream, ctx: &mut ChunkContext) -> BoxResult<Self> {
         let one = stream.read_one_return().await?;
         let fmt = one >> 6;
         let csid = one << 2 >> 2;
         let (timestamp, message_length, message_type_id, message_stream_id) = match fmt {
             0 => {
                 let h = stream.read_exact_return(11).await?;
-                (BigEndian::read_u24(&h[0..3]),
-                 BigEndian::read_u24(&h[3..6]),
-                 h[6],
-                 BigEndian::read_u32(&h[7..11]))
+                ctx.last_timestamp = BigEndian::read_u24(&h[0..3]);
+                ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
+                ctx.remain_message_length = 0;
+                ctx.last_message_type_id = h[6];
+                ctx.last_message_stream_id = BigEndian::read_u32(&h[7..11]);
+                (ctx.last_timestamp,
+                 ctx.last_message_length,
+                 ctx.last_message_type_id,
+                 ctx.last_message_stream_id)
             }
             1 => {
                 let h = stream.read_exact_return(7).await?;
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
-                ctx.last_timestamp = timestamp_delta;
-                (ctx.last_timestamp + timestamp_delta,
-                 BigEndian::read_u24(&h[3..6]),
-                 h[6],
+                ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
+                ctx.remain_message_length = 0;
+                ctx.last_message_type_id = h[6];
+                ctx.last_timestamp += timestamp_delta;
+                (ctx.last_timestamp,
+                 ctx.last_message_length,
+                 ctx.last_message_type_id,
                  ctx.last_message_stream_id)
             }
             2 => {
                 let h = stream.read_exact_return(3).await?;
-                (ctx.last_timestamp + BigEndian::read_u24(&h[0..3]),
+                let timestamp_delta = BigEndian::read_u24(&h[0..3]);
+                ctx.last_timestamp_delta = timestamp_delta;
+                ctx.last_timestamp += timestamp_delta;
+                (ctx.last_timestamp,
                  ctx.last_message_length,
                  ctx.last_message_type_id,
                  ctx.last_message_stream_id)
             }
             3 => {
-                (ctx.last_timestamp + ctx.last_timestamp_delta,
+                ctx.last_timestamp += ctx.last_timestamp_delta;
+                (ctx.last_timestamp,
                  ctx.last_message_length,
                  ctx.last_message_type_id,
                  ctx.last_message_stream_id)
             }
             _ => unreachable!()
         };
-        let message_data = stream.read_exact_return(message_length).await?;
+
+        // 当前分片的body长度
+        let read_num = {
+            let remain_length = if ctx.remain_message_length > 0 {
+                ctx.remain_message_length
+            } else {
+                message_length
+            };
+
+            if remain_length > ctx.chunk_size {
+                ctx.remain_message_length = remain_length - ctx.chunk_size;
+                ctx.chunk_size
+            } else {
+                ctx.remain_message_length = 0;
+                remain_length
+            }
+        };
+        let mut message_data = stream.read_exact_return(read_num).await?;
 
         Ok(ChunkMessage {
             header: ChunkMessageHeader {
@@ -244,11 +298,15 @@ impl ChunkMessage {
 
     /// 把body数据解析成amf0格式
     pub fn try_read_body_to_amf0(&self) -> Option<Vec<Value>> {
-        if self.header.message_type_id == 20 {
-            Some(read_all_amf_value(&self.message_data))
-        } else {
-            None
+        match self.header.message_type_id {
+            18 | 19 | 20 => Some(read_all_amf_value(&self.message_data)),
+            _ => None
         }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        /// TODO
+        unimplemented!()
     }
 }
 
@@ -277,7 +335,15 @@ pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
         }
         Value::Null => 1,
         Value::Undefined => 1,
-        Value::EcmaArray { entries: _ } => unimplemented!(),
+        Value::EcmaArray { entries } => {
+            // marker and tail
+            let mut len = 8;
+            for en in entries {
+                len += en.key.len() + 2;
+                len += calc_amf_byte_len(&en.value);
+            }
+            len
+        }
         Value::Array { entries: _ } => unimplemented!(),
         Value::Date { unix_time: _ } => unimplemented!(),
         Value::XmlDocument(_) => unimplemented!(),

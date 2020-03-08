@@ -22,6 +22,7 @@ use std::time::{SystemTime, Instant};
 use chrono::Local;
 use amf::Pair;
 use std::io::Write;
+use amf::amf0::Value;
 
 pub type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -83,13 +84,7 @@ async fn accept_loop(addr: &str) -> BoxResult<()> {
 
 async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     let zero_time = Local::now().timestamp_millis();
-    let mut ctx = ChunkContext {
-        last_timestamp_delta: 0,
-        last_timestamp: 0,
-        last_message_length: 0,
-        last_message_type_id: 0,
-        last_message_stream_id: 0,
-    };
+    let mut ctx = ChunkContext::new();
     /* C0/S0 */
     let c0 = stream.read_one_return().await?;
     log::info!("C0, version={}", c0);
@@ -130,19 +125,20 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     assert_eq!(s1.random_data, c2.random_echo);
     log::info!("Handshake done");
 
-    let set_window_size_packet = stream.read_exact_return(16).await?;
-    log::info!("C->S, set_window_size_packet:");
-    print_hex(set_window_size_packet.as_ref());
-
-    let connect_packet_header = stream.read_exact_return(12).await?;
-    let connect_body_length = BigEndian::read_u24(connect_packet_header[4..7].as_ref());
-    let connect_body = stream.read_exact_return(connect_body_length).await?;
-
-    /* parse connect body */
     {
-        let values = read_all_amf_value(&connect_body);
-        for v in values {
-            log::info!("C->S, connect_body part: {:?}", v);
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, set client chunk size {:?}", &message);
+        ctx.chunk_size = BigEndian::read_u32(&message.message_data);
+        log::info!("C->S, client chunk size = {}", &ctx.chunk_size);
+    };
+
+    {
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, connect_body header: {:?}, type: {:?}", &message.header, message.message_type_desc());
+        if let Some(values) = message.try_read_body_to_amf0() {
+            for v in values {
+                log::info!("C->S, connect_body part: {:?}", v);
+            }
         }
     }
 
@@ -243,7 +239,7 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
                 log::info!("C->S, createStream part: {:?}", v);
             }
             values
-        }else{
+        } else {
             Err("can't parse createStream message")?
         }
     };
@@ -298,24 +294,59 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
         print_hex(response_result.as_ref());
     }
 
-    log::info!("C->S, others:");
-    let mut i = 0;
-    let mut arr: [char; 8] = ['.'; 8];
+    {
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        // log::info!("C->S, onMetaData : {:?}", &message);
+        log::info!("C->S, onMetaData header: {:?}, type: {:?}", &message.header, message.message_type_desc());
+        if let Some(values) = message.try_read_body_to_amf0() {
+            for v in values {
+                if let Value::EcmaArray { entries } = v {
+                    log::info!("C->S, onMetaData part Array: ");
+                    for item in entries {
+                        log::info!("C->S, item: {:?}", item);
+                    }
+                } else {
+                    log::info!("C->S, onMetaData part: {:?}", v);
+                }
+            }
+        }
+    };
+
     loop {
-        let byte = stream.read_one_return().await?;
-        // print!("{:#04X}", byte);
-        // if byte.is_ascii_graphic() {
-        //     arr[i % 8] = byte as char;
-        // } else {
-        //     arr[i % 8] = '.';
-        // }
-        // print!(" ");
-        // std::io::stdout().flush()?;
-        // i += 1;
-        // if i % 8 == 0 {
-        //     println!("  {}", arr.iter().collect::<String>());
-        // }
-    }
+        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
+        log::info!("C->S, type: {:?}, header: {:?} ", message.message_type_desc(), &message.header);
+        if let Some(values) = message.try_read_body_to_amf0() {
+            for v in values {
+                if let Value::EcmaArray { entries } = v {
+                    log::info!("C->S, part Array: ");
+                    for item in entries {
+                        log::info!("C->S, item: {:?}", item);
+                    }
+                } else {
+                    log::info!("C->S, part: {:?}", v);
+                }
+            }
+        }
+    };
+
+    // log::info!("C->S, others:");
+    // let mut i = 0;
+    // let mut arr: [char; 8] = ['.'; 8];
+    // loop {
+    //     let byte = stream.read_one_return().await?;
+    //     print!("{:#04X}", byte);
+    //     if byte.is_ascii_graphic() {
+    //         arr[i % 8] = byte as char;
+    //     } else {
+    //         arr[i % 8] = '.';
+    //     }
+    //     print!(" ");
+    //     std::io::stdout().flush()?;
+    //     i += 1;
+    //     if i % 8 == 0 {
+    //         println!("  {}", arr.iter().collect::<String>());
+    //     }
+    // }
 
     Ok(())
 }
