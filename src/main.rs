@@ -1,35 +1,35 @@
-mod packet;
-mod extension;
+#[macro_use]
+extern crate num_derive;
 
-use async_std::task;
-use async_std::net::{TcpListener, ToSocketAddrs};
-use async_std::prelude::*;
+use std::io::Write;
+use std::sync::Arc;
+
+use amf::amf0::Value;
+use amf::Pair;
 use async_std::{
-    io::BufReader,
     net::TcpStream,
 };
-
-use futures::{select, FutureExt, AsyncReadExt};
-use futures::channel::mpsc;
-use futures::sink::SinkExt;
-use std::sync::Arc;
-use std::collections::hash_map::{Entry, HashMap};
-use crate::extension::{TcpStreamExtend, print_hex};
-use crate::packet::{Handshake0, Handshake1, Handshake2, calc_amf_byte_len, read_all_amf_value, ChunkMessage, ChunkContext};
+use async_std::net::TcpListener;
+use async_std::prelude::*;
+use async_std::sync::Mutex;
+use async_std::task;
 use byteorder::{BigEndian, ByteOrder};
-use rand::Rng;
-use std::time::{SystemTime, Instant};
 use chrono::Local;
-use amf::Pair;
-use std::io::Write;
-use amf::amf0::Value;
+use futures::StreamExt;
+use futures::channel::mpsc;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::sink::SinkExt;
+use rand::Rng;
+
+use crate::extension::{bytes_hex_format, print_hex, TcpStreamExtend};
+use crate::packet::*;
+
+mod packet;
+mod extension;
 
 pub type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn init_logger() {
-    use chrono::Local;
-    use std::io::Write;
-
     let env = env_logger::Env::default()
         .filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
     // 设置日志打印格式
@@ -73,18 +73,151 @@ async fn accept_loop(addr: &str) -> BoxResult<()> {
     let listener = TcpListener::bind(addr.clone()).await?;
     log::info!("Server is listening to {}", addr);
 
+    let (sender, receiver) = mpsc::unbounded();
+    let receiver = Arc::new(Mutex::new(receiver));
+
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         let stream = stream?;
         log::info!("new connection: {}", stream.peer_addr()?);
-        spawn_and_log_error(connection_loop(stream));
+        spawn_and_log_error(connection_loop(stream, sender.clone(), receiver.clone()));
     }
     Ok(())
 }
 
-async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
-    let zero_time = Local::now().timestamp_millis();
-    let mut ctx = ChunkContext::new();
+async fn connection_loop(
+    raw_stream: TcpStream,
+    mut sender: UnboundedSender<RtmpMessage>,
+    receiver: Arc<Mutex<UnboundedReceiver<RtmpMessage>>>) -> BoxResult<()> {
+    let mut ctx = RtmpContext::new();
+
+    let arc_stream = Arc::new(raw_stream);
+    let (mut stream, writer) = (&arc_stream.clone(), &arc_stream.clone());
+
+    handle_rtmp_handshake(stream, &mut ctx).await?;
+
+    loop {
+        let message = RtmpMessage::read_from(stream, &mut ctx).await?;
+        log::debug!("C->S, [{}] csid={}, msid={}", message.message_type_desc(), &message.header.csid, &message.header.msid);
+        match message.header.message_type {
+            ChunkMessageType::SetChunkSize => {
+                ctx.chunk_size = BigEndian::read_u32(&message.body);
+                log::info!("C->S, [{}] value={}", message.message_type_desc(),  &ctx.chunk_size);
+            }
+            ChunkMessageType::UserControlMessage => {
+                let bytes = &message.body;
+                let event_type = BigEndian::read_u16(&bytes[0..2]);
+                // set buffer length
+                if event_type == 3 {
+                    // 等于 create_stream 应答中第4个字段值
+                    let stream_id = BigEndian::read_u32(&bytes[2..6]);
+                    let buffer_length = BigEndian::read_u32(&bytes[6..10]);
+                    log::info!("C->S, [{}] set buffer length={}, streamId={}", message.message_type_desc(), buffer_length, stream_id);
+                    response_play(stream, stream_id).await?;
+                    let chunk_size = ctx.chunk_size.clone();
+                    let writer_weak = Arc::downgrade(&writer.clone());
+                    let recv = receiver.clone();
+                    task::spawn(async move {
+                        let mut recv = recv.lock().await;
+                        'out: while let Some(msg) = recv.next().await {
+                            log::info!("CHANNEL, [{}] len={}", msg.message_type_desc(), msg.header.message_length);
+                            let chunks = msg.split_chunks_bytes(chunk_size, stream_id);
+                            for item in chunks {
+                                print_hex(&item);
+                                if let Some(ref w) = writer_weak.upgrade() {
+                                    if let Err(e) = (w as &TcpStream).write(&item).await {
+                                        log::error!("CHANNEL error, {}" ,e);
+                                        break 'out;
+                                    }
+                                } else {
+                                    log::error!("CHANNEL, writer_weak is none");
+                                    break 'out;
+                                }
+                            }
+                        }
+                        log::info!("CHANNEL, task end");
+                    });
+                } else {
+                    log::info!("C->S, [{}] \n{}", message.message_type_desc(), bytes_hex_format(&message.body));
+                }
+            }
+            ChunkMessageType::AMF0CommandMessage => {
+                let option = message.try_read_body_to_amf0();
+                if option.is_none() {
+                    log::error!("C->S, ctx={:?} \n msg={:?}", &ctx, &message);
+                    unreachable!();
+                }
+                let values = option.unwrap();
+                let command = values[0].try_as_str().unwrap();
+                for v in &values {
+                    log::info!("C->S, {} part: {:?}",command, v);
+                }
+
+                match command {
+                    "connect" => {
+                        response_connect(&mut stream, &mut ctx).await?;
+                    }
+                    "createStream" => {
+                        response_create_stream(&mut stream, &values[1]).await?;
+                    }
+                    "publish" => {
+                        response_publish(stream).await?;
+                    }
+                    _ => ()
+                }
+            }
+            ChunkMessageType::AMF0DataMessage => {
+                let values = message.try_read_body_to_amf0().unwrap();
+                let command = values[0].try_as_str().unwrap();
+                for v in &values {
+                    if let Value::EcmaArray { entries } = v {
+                        log::info!("C->S, [{}] part Array: ",command);
+                        for item in entries {
+                            log::info!("C->S, [{}] item: {:?}", command, item);
+                        }
+                    } else {
+                        log::info!("C->S, [{}] part: {:?}", command, v);
+                    }
+                }
+                sender.send(message).await?;
+            }
+
+            ChunkMessageType::VideoMessage => {
+                log::info!("C->S, [{}] header={:?}", message.message_type_desc(), message.header);
+                // print_video_data(&message.body);
+                sender.send(message).await?;
+            }
+            ChunkMessageType::AudioMessage => {
+                // sender.send(message).await?;
+            }
+            _ => {
+                log::info!("C->S, [{}] OTHER len={}", message.message_type_desc(), message.header.message_length);
+            }
+        }
+    }
+
+// log::info!("C->S, others:");
+// let mut i = 0;
+// let mut arr: [char; 8] = ['.'; 8];
+// loop {
+//     let byte = stream.read_one_return().await?;
+//     print!("{:#04X}", byte);
+//     if byte.is_ascii_graphic() {
+//         arr[i % 8] = byte as char;
+//     } else {
+//         arr[i % 8] = '.';
+//     }
+//     print!(" ");
+//     std::io::stdout().flush()?;
+//     i += 1;
+//     if i % 8 == 0 {
+//         println!("  {}", arr.iter().collect::<String>());
+//     }
+// }
+}
+
+/// 处理RTMP握手流程
+async fn handle_rtmp_handshake(mut stream: &TcpStream, ctx: &mut RtmpContext) -> BoxResult<()> {
     /* C0/S0 */
     let c0 = stream.read_one_return().await?;
     log::info!("C0, version={}", c0);
@@ -99,16 +232,17 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
         random_data: c1_vec[8..Handshake1::PACKET_LENGTH as usize].to_vec(),
     };
     log::info!("C1, {:?}", c1);
-    let mut s1 = Handshake1 {
-        time: (Local::now().timestamp_millis() - zero_time) as u32,
+    let s1 = Handshake1 {
+        time: (Local::now().timestamp_millis() - ctx.ctx_begin_timestamp) as u32,
         zero: 0,
         random_data: gen_random_bytes(1528),
     };
     stream.write(s1.to_bytes().as_ref()).await?;
     log::info!("S1, {:?}", s1);
 
+
     /* C2/S2 */
-    let mut s2 = Handshake2 {
+    let s2 = Handshake2 {
         time: c1.time,
         time2: 0,
         random_echo: c1.random_data,
@@ -125,46 +259,45 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
     assert_eq!(s1.random_data, c2.random_echo);
     log::info!("Handshake done");
 
-    {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, set client chunk size {:?}", &message);
-        ctx.chunk_size = BigEndian::read_u32(&message.message_data);
-        log::info!("C->S, client chunk size = {}", &ctx.chunk_size);
-    };
+    ctx.recv_bytes_num += 1 + Handshake1::PACKET_LENGTH + Handshake2::PACKET_LENGTH;
+    Ok(())
+}
 
-    {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, connect_body header: {:?}, type: {:?}", &message.header, message.message_type_desc());
-        if let Some(values) = message.try_read_body_to_amf0() {
-            for v in values {
-                log::info!("C->S, connect_body part: {:?}", v);
-            }
-        }
-    }
-
+async fn response_connect(mut stream: &TcpStream, ctx: &mut RtmpContext) -> BoxResult<()> {
     {
         let ack_window_size = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00];
         stream.write(ack_window_size.as_ref()).await?;
         log::info!("S->C, ack_window_size_packet:");
         print_hex(ack_window_size.to_vec().as_ref());
     }
+
+    if ctx.chunk_size == 128 {
+        ctx.chunk_size = 4096;
+    }
+
     {
-        let set_peer_bandwidth = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x01];
-        stream.write(set_peer_bandwidth.as_ref()).await?;
+        let mut set_peer_bandwidth = vec![
+            0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x05, 0x06,
+            0x00, 0x00, 0x00, 0x00];
+        set_peer_bandwidth.append(&mut ctx.chunk_size.to_be_bytes().to_vec());
+        // 0-Hard, 1-Soft, 2-Dynamic
+        set_peer_bandwidth.push(0x01);
+
+        stream.write(&set_peer_bandwidth).await?;
         log::info!("S->C, set_peer_bandwidth:");
         print_hex(set_peer_bandwidth.to_vec().as_ref());
     }
 
     {
-        let set_chunk_size = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA0];
+        let mut set_chunk_size = vec![
+            0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x04, 0x01,
+            0x00, 0x00, 0x00, 0x00];
+        set_chunk_size.append(&mut ctx.chunk_size.to_be_bytes().to_vec());
         stream.write(set_chunk_size.as_ref()).await?;
         log::info!("S->C, set_chunk_size:");
         print_hex(set_chunk_size.to_vec().as_ref());
-    }
-
-    {
-        let chunk_message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, ack: {:?}", chunk_message);
     }
 
     {
@@ -211,65 +344,76 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
         print_hex(response_result.as_ref());
     }
 
-    {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, releaseStream header: {:?}, type: {:?}", &message.header, message.message_type_desc());
-        if let Some(values) = message.try_read_body_to_amf0() {
-            for v in values {
-                log::info!("C->S, releaseStream part: {:?}", v);
+    Ok(())
+}
+
+async fn response_create_stream(mut stream: &TcpStream, prev_command_number: &amf::amf0::Value) -> BoxResult<()> {
+    let mut response_result: Vec<u8> = vec![0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x14, 0x00, 0x00, 0x00, 0x00, ];
+    amf::amf0::Value::String("_result".to_string()).write_to(&mut response_result)?;
+    prev_command_number.write_to(&mut response_result)?;
+    amf::amf0::Value::Null.write_to(&mut response_result)?;
+    amf::amf0::Value::Number(9.0).write_to(&mut response_result)?;
+    response_result[6] = (response_result.len() - 12) as u8;
+    stream.write(response_result.as_ref()).await?;
+    log::info!("S->C, response_result:");
+    print_hex(response_result.as_ref());
+
+    Ok(())
+}
+
+async fn response_publish(mut stream: &TcpStream) -> BoxResult<()> {
+    let mut response_result: Vec<u8> = vec![0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x14, 0x00, 0x00, 0x00, 0x01, ];
+    amf::amf0::Value::String("onStatus".to_string()).write_to(&mut response_result)?;
+    amf::amf0::Value::Number(1.0).write_to(&mut response_result)?;
+    amf::amf0::Value::Null.write_to(&mut response_result)?;
+    amf::amf0::Value::Object {
+        class_name: None,
+        entries: vec![
+            Pair {
+                key: "level".to_owned(),
+                value: amf::amf0::Value::String("status".to_owned()),
+            },
+            Pair {
+                key: "code".to_owned(),
+                value: amf::amf0::Value::String("NetStream.Publish.Start".to_owned()),
+            },
+            Pair {
+                key: "description".to_owned(),
+                value: amf::amf0::Value::String("Start publishing".to_owned()),
             }
-        }
+        ],
+    }.write_to(&mut response_result)?;
+    response_result[6] = (response_result.len() - 12) as u8;
+    stream.write(response_result.as_ref()).await?;
+    log::info!("S->C, Start publishing:");
+    print_hex(response_result.as_ref());
+
+    Ok(())
+}
+
+async fn response_play(mut stream: &TcpStream, stream_id: u32) -> BoxResult<()> {
+    {
+        let mut rs: Vec<u8> = vec![
+            0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x06, 0x04,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00,
+        ];
+        let x: [u8; 4] = stream_id.to_be_bytes();
+        rs.append(&mut x.to_vec());
+        stream.write(rs.as_ref()).await?;
+        log::info!("S->C, Stream Begin, streamId={}", & stream_id);
     }
 
     {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, FCPublish header: {:?}, type: {:?}", &message.header, message.message_type_desc());
-        if let Some(values) = message.try_read_body_to_amf0() {
-            for v in values {
-                log::info!("C->S, FCPublish part: {:?}", v);
-            }
-        }
-    }
-
-    let create_stream_body = {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, createStream header: {:?}, type: {:?}", &message.header, message.message_type_desc());
-        if let Some(values) = message.try_read_body_to_amf0() {
-            for v in &values {
-                log::info!("C->S, createStream part: {:?}", v);
-            }
-            values
-        } else {
-            Err("can't parse createStream message")?
-        }
-    };
-
-    {
-        let mut response_result: Vec<u8> = vec![0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x14, 0x00, 0x00, 0x00, 0x00, ];
-        amf::amf0::Value::String("_result".to_string()).write_to(&mut response_result)?;
-        create_stream_body[1].write_to(&mut response_result)?;
-        amf::amf0::Value::Null.write_to(&mut response_result)?;
-        amf::amf0::Value::Number(1.0).write_to(&mut response_result)?;
-        response_result[6] = (response_result.len() - 12) as u8;
-        stream.write(response_result.as_ref()).await?;
-        log::info!("S->C, response_result:");
-        print_hex(response_result.as_ref());
-    }
-
-    {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, publish header: {:?}, type: {:?}", &message.header, message.message_type_desc());
-        if let Some(values) = message.try_read_body_to_amf0() {
-            for v in values {
-                log::info!("C->S, publish part: {:?}", v);
-            }
-        }
-    };
-
-    {
-        let mut response_result: Vec<u8> = vec![0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x14, 0x00, 0x00, 0x00, 0x01, ];
+        let mut response_result: Vec<u8> = vec![
+            0x05, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x14,
+            0x00, 0x00, 0x00, 0x01,
+        ];
         amf::amf0::Value::String("onStatus".to_string()).write_to(&mut response_result)?;
-        amf::amf0::Value::Number(1.0).write_to(&mut response_result)?;
+        amf::amf0::Value::Number(0.0).write_to(&mut response_result)?;
         amf::amf0::Value::Null.write_to(&mut response_result)?;
         amf::amf0::Value::Object {
             class_name: None,
@@ -280,79 +424,52 @@ async fn connection_loop(mut stream: TcpStream) -> BoxResult<()> {
                 },
                 Pair {
                     key: "code".to_owned(),
-                    value: amf::amf0::Value::String("NetStream.Publish.Start".to_owned()),
+                    value: amf::amf0::Value::String("NetStream.Play.Start".to_owned()),
                 },
                 Pair {
                     key: "description".to_owned(),
-                    value: amf::amf0::Value::String("Start publishing".to_owned()),
+                    value: amf::amf0::Value::String("Start live".to_owned()),
                 }
             ],
         }.write_to(&mut response_result)?;
         response_result[6] = (response_result.len() - 12) as u8;
         stream.write(response_result.as_ref()).await?;
-        log::info!("S->C, Start publishing:");
+        log::info!("S->C, Start play:");
         print_hex(response_result.as_ref());
     }
 
     {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        // log::info!("C->S, onMetaData : {:?}", &message);
-        log::info!("C->S, onMetaData header: {:?}, type: {:?}", &message.header, message.message_type_desc());
-        if let Some(values) = message.try_read_body_to_amf0() {
-            for v in values {
-                if let Value::EcmaArray { entries } = v {
-                    log::info!("C->S, onMetaData part Array: ");
-                    for item in entries {
-                        log::info!("C->S, item: {:?}", item);
-                    }
-                } else {
-                    log::info!("C->S, onMetaData part: {:?}", v);
-                }
-            }
-        }
-    };
-
-    loop {
-        let message = ChunkMessage::read_from(&mut stream, &mut ctx).await?;
-        log::info!("C->S, type: {:?}, header: {:?} ", message.message_type_desc(), &message.header);
-        if let Some(values) = message.try_read_body_to_amf0() {
-            for v in values {
-                if let Value::EcmaArray { entries } = v {
-                    log::info!("C->S, part Array: ");
-                    for item in entries {
-                        log::info!("C->S, item: {:?}", item);
-                    }
-                } else {
-                    log::info!("C->S, part: {:?}", v);
-                }
-            }
-        }
-    };
-
-    // log::info!("C->S, others:");
-    // let mut i = 0;
-    // let mut arr: [char; 8] = ['.'; 8];
-    // loop {
-    //     let byte = stream.read_one_return().await?;
-    //     print!("{:#04X}", byte);
-    //     if byte.is_ascii_graphic() {
-    //         arr[i % 8] = byte as char;
-    //     } else {
-    //         arr[i % 8] = '.';
-    //     }
-    //     print!(" ");
-    //     std::io::stdout().flush()?;
-    //     i += 1;
-    //     if i % 8 == 0 {
-    //         println!("  {}", arr.iter().collect::<String>());
-    //     }
-    // }
-
+        let mut response_result: Vec<u8> = vec![
+            0x05, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x14,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        amf::amf0::Value::String("|RtmpSampleAccess".to_string()).write_to(&mut response_result)?;
+        amf::amf0::Value::Boolean(true).write_to(&mut response_result)?;
+        amf::amf0::Value::Boolean(true).write_to(&mut response_result)?;
+        response_result[6] = (response_result.len() - 12) as u8;
+        stream.write(response_result.as_ref()).await?;
+        log::info!("S->C, Start play:");
+        print_hex(response_result.as_ref());
+    }
     Ok(())
 }
 
+// async fn send_ack(stream: &mut TcpStream, ctx: &mut RtmpContext) -> BoxResult<()> {
+//     let mut ack_frame = vec![
+//         0x02, 0x00, 0x00, 0x00,
+//         0x00, 0x00, 0x04, 0x03,
+//         0x00, 0x00, 0x00, 0x00,
+//     ];
+//     let mut ack_frame_body: [u8; 4] = ctx.recv_bytes_num.to_be_bytes();
+//     ack_frame.append(&mut ack_frame_body.to_vec());
+//     stream.write(&ack_frame).await?;
+//
+//     Ok(())
+// }
+
 fn main() -> BoxResult<()> {
     init_logger();
-    let server = "127.0.0.1:12345";
+    let server = "127.0.0.1:1935";
     task::block_on(accept_loop(server))
 }

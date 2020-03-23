@@ -1,13 +1,14 @@
-use chrono::format::Pad::Zero;
-use std::collections::HashMap;
-use byteorder::{BigEndian, ByteOrder};
+use std::fmt::{Debug, Formatter};
+
 use amf::amf0;
 use amf::amf0::Value;
 use async_std::net::TcpStream;
-use crate::BoxResult;
-use crate::extension::{TcpStreamExtend, bytes_hex_format};
-use std::fmt::{Debug, Formatter, Error};
+use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
+use chrono::Local;
 
+use crate::BoxResult;
+use crate::extension::{bytes_hex_format, TcpStreamExtend, print_hex};
+use num::FromPrimitive;
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -52,7 +53,6 @@ pub struct Handshake1 {
 
 impl Handshake1 {
     pub const PACKET_LENGTH: u32 = 1536;
-    pub const RANDOM_DATA_LENGTH: u32 = 1528;
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::new();
         v.append(self.time.to_be_bytes().to_vec().as_mut());
@@ -89,65 +89,9 @@ impl Handshake2 {
     }
 }
 
-pub enum ChunkMessageHeaderType {
-    /// Type 0 chunk headers are 11 bytes long. This type MUST be used at
-    /// the start of a chunk stream, and whenever the stream timestamp goes
-    /// backward (e.g., because of a backward seek)
-    Type0 {
-        /// timestamp (3 bytes): For a type-0 chunk, the absolute timestamp of
-        /// the message is sent here. If the timestamp is greater than or
-        /// equal to 16777215 (hexadecimal 0xFFFFFF), this field MUST be
-        /// 16777215, indicating the presence of the Extended Timestamp field
-        /// to encode the full 32 bit timestamp. Otherwise, this field SHOULD
-        /// be the entire timestamp.
-        timestamp: u32,
-        // 3 byte
-        message_length: u32,
-        //
-        message_type_id: u8,
-        // LE
-        message_stream_id: u32,
-    },
-    /// Type 1 chunk headers are 7 bytes long. The message stream ID is not
-    /// included; this chunk takes the same stream ID as the preceding chunk.
-    /// Streams with variable-sized messages (for example, many video
-    /// formats) SHOULD use this format for the first chunk of each new
-    /// message after the first.
-    Type1 {
-        // 3 byte
-        timestamp_delta: u32,
-        // 3 byte
-        message_length: u32,
-        //
-        message_type_id: u8,
-    },
-    /// Type 2 chunk headers are 3 bytes long. Neither the stream ID nor the
-    /// message length is included; this chunk has the same stream ID and
-    /// message length as the preceding chunk. Streams with constant-sized
-    /// messages (for example, some audio and data formats) SHOULD use this
-    /// format for the first chunk of each message after the first.
-    Type2 {
-        timestamp_delta: u32,
-    },
-    /// Type 3 chunks have no message header. The stream ID, message length
-    /// and timestamp delta fields are not present; chunks of this type take
-    /// values from the preceding chunk for the same Chunk Stream ID. When a
-    /// single message is split into chunks, all chunks of a message except
-    /// the first one SHOULD use this type. Refer to Example 2
-    /// (Section 5.3.2.2). A stream consisting of messages of exactly the
-    /// same size, stream ID and spacing in time SHOULD use this type for all
-    /// chunks after a chunk of Type 2. Refer to Example 1
-    /// (Section 5.3.2.1). If the delta between the first message and the
-    /// second message is same as the timestamp of the first message, then a
-    /// chunk of Type 3 could immediately follow the chunk of Type 0 as there
-    /// is no need for a chunk of Type 2 to register the delta. If a Type 3
-    /// chunk follows a Type 0 chunk, then the timestamp delta for this Type
-    /// 3 chunk is the same as the timestamp of the Type 0 chunk.
-    Type3,
-}
-
-
-pub struct ChunkContext {
+#[derive(Debug)]
+pub struct RtmpContext {
+    pub ctx_begin_timestamp: i64,
     pub last_timestamp: u32,
     pub last_timestamp_delta: u32,
     pub last_message_length: u32,
@@ -155,11 +99,13 @@ pub struct ChunkContext {
     pub last_message_stream_id: u32,
     pub chunk_size: u32,
     pub remain_message_length: u32,
+    pub recv_bytes_num: u32,
 }
 
-impl ChunkContext {
+impl RtmpContext {
     pub fn new() -> Self {
-        ChunkContext {
+        RtmpContext {
+            ctx_begin_timestamp: Local::now().timestamp_millis(),
             last_timestamp_delta: 0,
             last_timestamp: 0,
             last_message_length: 0,
@@ -167,47 +113,72 @@ impl ChunkContext {
             last_message_stream_id: 0,
             chunk_size: 128,
             remain_message_length: 0,
+            recv_bytes_num: 0,
         }
     }
 }
 
 #[derive(Debug)]
-pub struct ChunkMessageHeader {
-    pub chunk_stream_id: u32,
+pub struct RtmpMessageHeader {
+    /// chunk stream id
+    /// 2 (low level), 3 (high level), 4 (control stream), 5 (video) and 6 (audio).
+    pub csid: u8,
     pub timestamp: u32,
     pub message_length: u32,
     pub message_type_id: u8,
-    pub message_stream_id: u32,
+    pub message_type: ChunkMessageType,
+    /// message stream id
+    pub msid: u32,
 }
 
-pub struct ChunkMessage {
-    pub header: ChunkMessageHeader,
-    pub message_data: Vec<u8>,
+impl RtmpMessageHeader {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut rs = vec![self.csid];
+        rs.write_u24::<BigEndian>(self.timestamp).unwrap();
+        rs.write_u24::<BigEndian>(self.message_length).unwrap();
+        rs.write_u8(self.message_type_id).unwrap();
+        rs.write_u32::<BigEndian>(self.msid).unwrap();
+        rs
+    }
 }
 
-impl ChunkMessage {
-    pub async fn read_from(stream: &mut TcpStream, ctx: &mut ChunkContext) -> BoxResult<Self> {
-        let mut chunk = ChunkMessage::read_one_from(stream, ctx).await?;
+pub struct RtmpMessage {
+    pub header: RtmpMessageHeader,
+    pub body: Vec<u8>,
+    pub chunk_count: u32,
+}
+
+impl RtmpMessage {
+    /// 读取完整消息
+    pub async fn read_from(stream: &TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
+        let mut chunk = RtmpMessage::read_chunk_from(stream, ctx).await?;
         while ctx.remain_message_length > 0 {
-            let mut remain_chunk = ChunkMessage::read_one_from(stream, ctx).await?;
-            chunk.message_data.append(&mut remain_chunk.message_data);
+            let mut remain_chunk = RtmpMessage::read_chunk_from(stream, ctx).await?;
+            chunk.body.append(&mut remain_chunk.body);
+            chunk.chunk_count += 1;
         }
 
         Ok(chunk)
     }
 
-    pub async fn read_one_from(stream: &mut TcpStream, ctx: &mut ChunkContext) -> BoxResult<Self> {
+    /// 读取一个消息分片
+    async fn read_chunk_from(stream: &TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
         let one = stream.read_one_return().await?;
         let fmt = one >> 6;
         let csid = one << 2 >> 2;
         let (timestamp, message_length, message_type_id, message_stream_id) = match fmt {
             0 => {
                 let h = stream.read_exact_return(11).await?;
+                print_hex(&h);
+                // 时间差值置零
+                ctx.last_timestamp_delta = 0;
                 ctx.last_timestamp = BigEndian::read_u24(&h[0..3]);
                 ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
                 ctx.remain_message_length = 0;
                 ctx.last_message_type_id = h[6];
                 ctx.last_message_stream_id = BigEndian::read_u32(&h[7..11]);
+                ctx.recv_bytes_num += 12;
+
                 (ctx.last_timestamp,
                  ctx.last_message_length,
                  ctx.last_message_type_id,
@@ -215,11 +186,14 @@ impl ChunkMessage {
             }
             1 => {
                 let h = stream.read_exact_return(7).await?;
+                // bytes_hex_format(&h);
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
                 ctx.remain_message_length = 0;
                 ctx.last_message_type_id = h[6];
                 ctx.last_timestamp += timestamp_delta;
+                ctx.recv_bytes_num += 8;
+
                 (ctx.last_timestamp,
                  ctx.last_message_length,
                  ctx.last_message_type_id,
@@ -230,6 +204,8 @@ impl ChunkMessage {
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_timestamp_delta = timestamp_delta;
                 ctx.last_timestamp += timestamp_delta;
+                ctx.recv_bytes_num += 4;
+
                 (ctx.last_timestamp,
                  ctx.last_message_length,
                  ctx.last_message_type_id,
@@ -261,17 +237,20 @@ impl ChunkMessage {
                 remain_length
             }
         };
-        let mut message_data = stream.read_exact_return(read_num).await?;
+        let message_data = stream.read_exact_return(read_num).await?;
+        ctx.recv_bytes_num += read_num;
 
-        Ok(ChunkMessage {
-            header: ChunkMessageHeader {
-                chunk_stream_id: csid as u32,
-                message_stream_id,
+        Ok(RtmpMessage {
+            header: RtmpMessageHeader {
+                csid,
+                msid: message_stream_id,
                 message_length,
                 timestamp,
                 message_type_id,
+                message_type: FromPrimitive::from_u8(message_type_id).unwrap(),
             },
-            message_data,
+            body: message_data,
+            chunk_count: 1,
         })
     }
 
@@ -299,24 +278,70 @@ impl ChunkMessage {
     /// 把body数据解析成amf0格式
     pub fn try_read_body_to_amf0(&self) -> Option<Vec<Value>> {
         match self.header.message_type_id {
-            18 | 19 | 20 => Some(read_all_amf_value(&self.message_data)),
+            18 | 19 | 20 => read_all_amf_value(&self.body),
             _ => None
         }
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        /// TODO
-        unimplemented!()
+    pub fn split_chunks_bytes(&self, chunk_size: u32, msid: u32) -> Vec<Vec<u8>> {
+        let chunk_size = chunk_size as usize;
+        let mut rs = vec![];
+
+        let mut remain = self.body.clone();
+        while remain.len() > chunk_size {
+            let right = remain.split_off(chunk_size);
+            rs.push(remain);
+            remain = right;
+        }
+        rs.push(remain);
+
+        // 添加type0头部
+        for item in msid.to_be_bytes().iter().rev() {
+            (&mut rs[0]).insert(0, item.clone());
+        }
+        for item in self.header.to_bytes()[0..8].iter().rev() {
+            (&mut rs[0]).insert(0, item.clone());
+        }
+
+        // 添加type3头部
+        if rs.len() > 1 {
+            let type3_fmt = 0xC0 | self.header.csid;
+            for item in &mut rs[1..] {
+                item.insert(0, type3_fmt);
+            }
+        }
+
+        rs
     }
 }
 
-impl Debug for ChunkMessage {
+impl Debug for RtmpMessage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ChunkMessage {{\nheader: {:?}\nmessage type: {}\nbody:\n{}}}",
+        write!(f, "ChunkMessage {{\nheader: {:?}\nmessage type: {}\nchunk count={}\nbody:\n{}}}",
                self.header,
                self.message_type_desc(),
-               bytes_hex_format(&self.message_data))
+               self.chunk_count,
+               bytes_hex_format(&self.body))
     }
+}
+
+#[derive(Debug, PartialEq, FromPrimitive)]
+pub enum ChunkMessageType {
+    SetChunkSize = 1,
+    AbortMessage = 2,
+    Acknowledgement = 3,
+    UserControlMessage = 4,
+    WindowAcknowledgementSize = 5,
+    SetPeerBandwidth = 6,
+    AMF3CommandMessage = 17,
+    AMF0CommandMessage = 20,
+    AMF3DataMessage = 15,
+    AMF0DataMessage = 18,
+    AMF3SharedObjectMessage = 16,
+    AMF0SharedObjectMessage = 19,
+    AudioMessage = 8,
+    VideoMessage = 9,
+    AggregateMessage = 22,
 }
 
 pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
@@ -351,21 +376,103 @@ pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
     }
 }
 
-pub fn read_all_amf_value(bytes: &[u8]) -> Vec<Value> {
+pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
     let mut read_num = 0;
     let mut list = Vec::new();
 
     loop {
-        let v = amf::amf0::Value::read_from(&mut &bytes[read_num..]).unwrap();
-        let len = calc_amf_byte_len(&v);
-        read_num += len;
-        list.push(v);
+        if let Ok(v) = amf::amf0::Value::read_from(&mut &bytes[read_num..]) {
+            let len = calc_amf_byte_len(&v);
+            read_num += len;
+            list.push(v);
 
-        if read_num >= bytes.len() {
-            break;
+            if read_num >= bytes.len() {
+                break;
+            }
+        } else {
+            return None;
         }
     }
-    list
+    Some(list)
+}
+
+pub fn print_video_data(bytes: &[u8]) {
+    let frame_type = bytes[0];
+    log::info!( "video frame type = {:#04X}", frame_type);
+    let mut read_index = 1;
+    let acv_packet_type = bytes[read_index];
+    read_index += 1;
+
+    let data_len = if acv_packet_type == 0 {
+        let composition_time_offset = &bytes[read_index..read_index + 3];
+        read_index += 3;
+        let avc_profile = &bytes[read_index..read_index + 4];
+        read_index += 4;
+        let length_size_minus_one = &bytes[read_index];
+        read_index += 1;
+        let num_of_sps = &bytes[read_index] & 0x1F;
+        read_index += 1;
+        println!("sps num = {}", num_of_sps);
+        for _ in 0..num_of_sps as usize {
+            let data_len = BigEndian::read_u16(&bytes[read_index..]);
+            read_index += 2;
+            let data = &bytes[read_index..(read_index + data_len as usize)];
+            read_index += data_len as usize;
+            println!("len={}, sps data:\n{}", data_len, bytes_hex_format(data));
+        }
+        let num_of_pps = &bytes[read_index] & 0x1F;
+        read_index += 1;
+        println!("pps num = {}", num_of_pps);
+        for _ in 0..num_of_pps as usize {
+            let data_len = BigEndian::read_u16(&bytes[read_index..]);
+            read_index += 2;
+            let data = &bytes[read_index..(read_index + data_len as usize)];
+            read_index += data_len as usize;
+            println!("len={}, pps data:\n{}", data_len, bytes_hex_format(data));
+        }
+    } else {
+        let composition_time_offset = &bytes[read_index..read_index + 3];
+        read_index += 3;
+        loop {
+            if read_index >= bytes.len() {
+                break;
+            }
+            let data_len = BigEndian::read_u32(&bytes[read_index..]);
+            read_index += 4;
+            let data = &bytes[read_index..(read_index + data_len as usize)];
+            read_index += data_len as usize;
+            // println!("NALU Type: {}, len={}", nalu_type_desc(&data[0]), data_len);
+            println!("len={}, nalu data:\n{}", data_len, bytes_hex_format(data));
+        }
+    };
+}
+
+fn nalu_type_desc(nalu_type: &u8) -> String {
+    let priority: String = match (nalu_type & 0x60) >> 5 {
+        0 => "DISPOSABLE".into(),
+        1 => "LOW".into(),
+        2 => "HIGH".into(),
+        3 => "HIGHEST".into(),
+        _ => "UNKNOWN".into(),
+    };
+
+    let t: String = match nalu_type & 0x1F {
+        1 => "SLICE".into(),
+        2 => "DPA".into(),
+        3 => "DPB".into(),
+        4 => "DPC".into(),
+        5 => "IDR".into(),
+        6 => "SEI".into(),
+        7 => "SPS".into(),
+        8 => "PPS".into(),
+        9 => "AUD".into(),
+        10 => "EOSEQ".into(),
+        11 => "EOSTREAM".into(),
+        12 => "FILL".into(),
+        _ => "UNKNOWN".into(),
+    };
+
+    format!("{}::{}", priority, t)
 }
 
 
