@@ -4,11 +4,12 @@ use amf::amf0;
 use amf::amf0::Value;
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use chrono::Local;
+use num::FromPrimitive;
+use smol::io::{AsyncReadExt, AsyncWriteExt};
+use smol::net::TcpStream;
 
 use crate::BoxResult;
-use crate::extension::{bytes_hex_format, TcpStreamExtend, print_hex};
-use num::FromPrimitive;
-use smol::net::TcpStream;
+use crate::extension::{bytes_hex_format, print_hex};
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -91,6 +92,7 @@ impl Handshake2 {
 
 #[derive(Debug)]
 pub struct RtmpContext {
+    pub stream: TcpStream,
     pub ctx_begin_timestamp: i64,
     pub last_timestamp: u32,
     pub last_timestamp_delta: u32,
@@ -103,8 +105,9 @@ pub struct RtmpContext {
 }
 
 impl RtmpContext {
-    pub fn new() -> Self {
+    pub fn new(stream: TcpStream) -> Self {
         RtmpContext {
+            stream,
             ctx_begin_timestamp: Local::now().timestamp_millis(),
             last_timestamp_delta: 0,
             last_timestamp: 0,
@@ -115,6 +118,17 @@ impl RtmpContext {
             remain_message_length: 0,
             recv_bytes_num: 0,
         }
+    }
+
+    pub async fn read_exact_return(&mut self, bytes_num: u32) -> anyhow::Result<Vec<u8>> {
+        let mut data = vec![0u8; bytes_num as usize];
+        AsyncReadExt::read_exact(&mut self.stream, &mut data).await?;
+        Ok(data)
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.stream.write_all(bytes).await?;
+        Ok(())
     }
 }
 
@@ -150,10 +164,10 @@ pub struct RtmpMessage {
 
 impl RtmpMessage {
     /// 读取完整消息
-    pub async fn read_from(stream: &mut TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
-        let mut chunk = RtmpMessage::read_chunk_from(stream, ctx).await?;
+    pub async fn read_from(ctx: &mut RtmpContext) -> BoxResult<Self> {
+        let mut chunk = RtmpMessage::read_chunk_from(ctx).await?;
         while ctx.remain_message_length > 0 {
-            let mut remain_chunk = RtmpMessage::read_chunk_from(stream, ctx).await?;
+            let mut remain_chunk = RtmpMessage::read_chunk_from(ctx).await?;
             chunk.body.append(&mut remain_chunk.body);
             chunk.chunk_count += 1;
         }
@@ -162,13 +176,13 @@ impl RtmpMessage {
     }
 
     /// 读取一个消息分片
-    async fn read_chunk_from(stream: &mut TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
-        let one = stream.read_one_return().await?;
+    async fn read_chunk_from(ctx: &mut RtmpContext) -> BoxResult<Self> {
+        let one = ctx.read_exact_return(1).await?[0];
         let fmt = one >> 6;
         let csid = one << 2 >> 2;
         let (timestamp, message_length, message_type_id, message_stream_id) = match fmt {
             0 => {
-                let h = stream.read_exact_return(11).await?;
+                let h = ctx.read_exact_return(11).await?;
                 print_hex(&h);
                 // 时间差值置零
                 ctx.last_timestamp_delta = 0;
@@ -185,7 +199,7 @@ impl RtmpMessage {
                  ctx.last_message_stream_id)
             }
             1 => {
-                let h = stream.read_exact_return(7).await?;
+                let h = ctx.read_exact_return(7).await?;
                 // bytes_hex_format(&h);
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
@@ -200,7 +214,7 @@ impl RtmpMessage {
                  ctx.last_message_stream_id)
             }
             2 => {
-                let h = stream.read_exact_return(3).await?;
+                let h = ctx.read_exact_return(3).await?;
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_timestamp_delta = timestamp_delta;
                 ctx.last_timestamp += timestamp_delta;
@@ -237,9 +251,11 @@ impl RtmpMessage {
                 remain_length
             }
         };
-        let message_data = stream.read_exact_return(read_num).await?;
+        let message_data = ctx.read_exact_return(read_num).await?;
         ctx.recv_bytes_num += read_num;
 
+        let message_type = FromPrimitive::from_u8(message_type_id)
+            .ok_or(anyhow::anyhow!(format!("invalid message type: {}", message_type_id)))?;
         Ok(RtmpMessage {
             header: RtmpMessageHeader {
                 csid,
@@ -247,7 +263,7 @@ impl RtmpMessage {
                 message_length,
                 timestamp,
                 message_type_id,
-                message_type: FromPrimitive::from_u8(message_type_id).unwrap(),
+                message_type,
             },
             body: message_data,
             chunk_count: 1,
@@ -398,7 +414,7 @@ pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
 
 pub fn print_video_data(bytes: &[u8]) {
     let frame_type = bytes[0];
-    log::info!( "video frame type = {:#04X}", frame_type);
+    log::info!("video frame type = {:#04X}", frame_type);
     let mut read_index = 1;
     let acv_packet_type = bytes[read_index];
     read_index += 1;
