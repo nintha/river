@@ -1,16 +1,14 @@
-use async_std::{
-    net::TcpStream,
-};
 use async_trait::async_trait;
-use futures::{AsyncReadExt};
 use super::BoxResult;
+use smol::net::TcpStream;
+use smol::io::AsyncReadExt;
 
 #[async_trait]
 pub trait TcpStreamExtend {
     /// blocking read some bytes from `TcpStream`
-    async fn read_exact_return(&self, bytes_num: u32) -> BoxResult<Vec<u8>>;
+    async fn read_exact_return(&mut self, bytes_num: u32) -> BoxResult<Vec<u8>>;
     /// blocking read one byte from `TcpStream`
-    async fn read_one_return(&self) -> BoxResult<u8> {
+    async fn read_one_return(&mut self) -> BoxResult<u8> {
         self.read_exact_return(1).await.map(|v| v[0])
     }
 }
@@ -18,7 +16,7 @@ pub trait TcpStreamExtend {
 #[async_trait]
 impl TcpStreamExtend for TcpStream {
     /// blocking read some bytes from `TcpStream`
-    async fn read_exact_return(mut self: &Self, bytes_num: u32) -> BoxResult<Vec<u8>> {
+    async fn read_exact_return(&mut self, bytes_num: u32) -> BoxResult<Vec<u8>> {
         let mut data = vec![0u8; bytes_num as usize];
         self.read_exact(&mut data).await?;
         return Ok(data);
@@ -59,7 +57,7 @@ pub fn bytes_hex_format(bytes: &[u8]) -> String {
         for _ in 0..(COLUMN - 1 - (i - 1) % COLUMN) {
             text += "   ";
         }
-        for _ in 0..(COLUMN + 8 - i % COLUMN ) / 8 {
+        for _ in 0..(COLUMN + 8 - i % COLUMN) / 8 {
             text += COL_SPACE;
         }
 

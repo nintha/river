@@ -2,13 +2,13 @@ use std::fmt::{Debug, Formatter};
 
 use amf::amf0;
 use amf::amf0::Value;
-use async_std::net::TcpStream;
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use chrono::Local;
 
 use crate::BoxResult;
 use crate::extension::{bytes_hex_format, TcpStreamExtend, print_hex};
 use num::FromPrimitive;
+use smol::net::TcpStream;
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -150,7 +150,7 @@ pub struct RtmpMessage {
 
 impl RtmpMessage {
     /// 读取完整消息
-    pub async fn read_from(stream: &TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
+    pub async fn read_from(stream: &mut TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
         let mut chunk = RtmpMessage::read_chunk_from(stream, ctx).await?;
         while ctx.remain_message_length > 0 {
             let mut remain_chunk = RtmpMessage::read_chunk_from(stream, ctx).await?;
@@ -162,7 +162,7 @@ impl RtmpMessage {
     }
 
     /// 读取一个消息分片
-    async fn read_chunk_from(stream: &TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
+    async fn read_chunk_from(stream: &mut TcpStream, ctx: &mut RtmpContext) -> BoxResult<Self> {
         let one = stream.read_one_return().await?;
         let fmt = one >> 6;
         let csid = one << 2 >> 2;
