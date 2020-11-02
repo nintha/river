@@ -1,51 +1,25 @@
 #[macro_use]
 extern crate num_derive;
-
-use std::io::Write;
-use std::sync::Arc;
-
 use amf::amf0::Value;
 use amf::Pair;
 use byteorder::{BigEndian, ByteOrder};
 use chrono::Local;
 use rand::Rng;
-use smol::channel::{Receiver, Sender};
-use smol::lock::Mutex;
 use smol::net::{TcpListener, TcpStream};
 use smol::prelude::*;
 
-use crate::extension::{bytes_hex_format, print_hex};
-use crate::packet::*;
+use protocol::rtmp::*;
 
-mod packet;
-mod extension;
+use crate::util::{bytes_hex_format, print_hex};
 
-pub type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-
-fn init_logger() {
-    let env = env_logger::Env::default()
-        .filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
-    // 设置日志打印格式
-    env_logger::Builder::from_env(env)
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} {} [{}] {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                buf.default_styled_level(record.level()),
-                record.module_path().unwrap_or("<unnamed>"),
-                &record.args()
-            )
-        })
-        .init();
-    log::info!("env_logger initialized.");
-}
+mod util;
+mod protocol;
 
 /// 执行一个新协程，并且在错误时打印错误信息
-fn spawn_and_log_error<F>(fut: F) where F: Future<Output=BoxResult<()>> + Send + 'static {
+fn spawn_and_log_error<F>(fut: F) where F: Future<Output=anyhow::Result<()>> + Send + 'static {
     smol::spawn(async move {
         if let Err(e) = fut.await {
-            log::error!("error, {:?}", e)
+            log::error!("spawn future error, {:?}", e)
         }
     }).detach();
 }
@@ -60,28 +34,21 @@ fn gen_random_bytes(len: u32) -> Vec<u8> {
 }
 
 /// TCP 连接处理
-async fn accept_loop(addr: &str) -> BoxResult<()> {
+async fn accept_loop(addr: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr.clone()).await?;
     log::info!("Server is listening to {}", addr);
-
-    let (sender, receiver) = smol::channel::unbounded();
-    let receiver = Arc::new(Mutex::new(receiver));
 
     let mut incoming = listener.incoming();
     while let Some(stream) = incoming.next().await {
         let stream = stream?;
         log::info!("new connection: {}", stream.peer_addr()?);
-        spawn_and_log_error(connection_loop(stream, sender.clone(), receiver.clone()));
+        spawn_and_log_error(connection_loop(stream));
     }
     Ok(())
 }
 
-async fn connection_loop(
-    raw_stream: TcpStream,
-    mut _sender: Sender<RtmpMessage>,
-    receiver: Arc<Mutex<Receiver<RtmpMessage>>>) -> BoxResult<()> {
-    let writer = raw_stream.clone();
-    let mut ctx = RtmpContext::new(raw_stream);
+async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
+    let mut ctx = RtmpContext::new(stream);
 
     handle_rtmp_handshake(&mut ctx).await?;
 
@@ -103,23 +70,7 @@ async fn connection_loop(
                     let buffer_length = BigEndian::read_u32(&bytes[6..10]);
                     log::info!("C->S, [{}] set buffer length={}, streamId={}", message.message_type_desc(), buffer_length, stream_id);
                     response_play(&mut ctx, stream_id).await?;
-                    let chunk_size = ctx.chunk_size.clone();
-                    let mut writer_ref = writer.clone();
-                    let receiver = receiver.clone();
-                    smol::spawn(async move {
-                        'out: while let Ok(msg) = receiver.lock().await.recv().await {
-                            log::info!("CHANNEL, [{}] len={}", msg.message_type_desc(), msg.header.message_length);
-                            let chunks = msg.split_chunks_bytes(chunk_size, stream_id);
-                            for item in chunks {
-                                print_hex(&item);
-                                if let Err(e) = (&mut writer_ref).write(&item).await {
-                                    log::error!("CHANNEL error, {}", e);
-                                    break 'out;
-                                }
-                            }
-                        }
-                        log::info!("CHANNEL, task end");
-                    }).detach();
+                    // TODO send video stream to peer
                 } else {
                     log::info!("C->S, [{}] \n{}", message.message_type_desc(), bytes_hex_format(&message.body));
                 }
@@ -167,7 +118,7 @@ async fn connection_loop(
 
             ChunkMessageType::VideoMessage => {
                 log::info!("C->S, [{}] header={:?}", message.message_type_desc(), message.header);
-                // print_video_data(&message.body);
+                print_video_data(&mut ctx, &message.body);
                 // sender.send(message).await?;
             }
             ChunkMessageType::AudioMessage => {
@@ -202,10 +153,10 @@ async fn connection_loop(
 /// 处理RTMP握手流程
 async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
     /* C0/C1 */
-    let c0 = ctx.read_exact_return(1).await?[0];
+    let c0 = ctx.read_exact_from_stream(1).await?[0];
     log::info!("C0, version={}", c0);
 
-    let c1_vec = ctx.read_exact_return(Handshake1::PACKET_LENGTH).await?;
+    let c1_vec = ctx.read_exact_from_stream(Handshake1::PACKET_LENGTH).await?;
     let c1 = Handshake1 {
         time: BigEndian::read_u32(&c1_vec[0..4]),
         zero: BigEndian::read_u32(&c1_vec[4..8]),
@@ -214,7 +165,7 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
     log::info!("C1, {:?}", c1);
 
     /* S0/S1/S2 */
-    ctx.write(Handshake0::S0_V3.to_bytes().as_ref()).await?;
+    ctx.write_to_stream(Handshake0::S0_V3.to_bytes().as_ref()).await?;
     log::info!("S0, version={:?}", Handshake0::S0_V3);
 
     let s1 = Handshake1 {
@@ -222,7 +173,7 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         zero: 0,
         random_data: gen_random_bytes(1528),
     };
-    ctx.write(s1.to_bytes().as_ref()).await?;
+    ctx.write_to_stream(s1.to_bytes().as_ref()).await?;
     log::info!("S1, {:?}", s1);
 
     let s2 = Handshake2 {
@@ -230,12 +181,12 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         time2: 0,
         random_echo: c1.random_data,
     };
-    ctx.write(s2.to_bytes().as_ref()).await?;
+    ctx.write_to_stream(s2.to_bytes().as_ref()).await?;
     log::info!("S2, {:?}", s2);
 
 
     /* C2*/
-    let c2_vec = ctx.read_exact_return(Handshake2::PACKET_LENGTH).await?;
+    let c2_vec = ctx.read_exact_from_stream(Handshake2::PACKET_LENGTH).await?;
     let c2 = Handshake2 {
         time: BigEndian::read_u32(&c2_vec[0..4]),
         time2: BigEndian::read_u32(&c2_vec[4..8]),
@@ -249,10 +200,10 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn response_connect(ctx: &mut RtmpContext) -> BoxResult<()> {
+async fn response_connect(ctx: &mut RtmpContext) -> anyhow::Result<()> {
     {
         let ack_window_size = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00];
-        ctx.write(ack_window_size.as_ref()).await?;
+        ctx.write_to_stream(ack_window_size.as_ref()).await?;
         log::info!("S->C, ack_window_size_packet:");
         print_hex(ack_window_size.to_vec().as_ref());
     }
@@ -270,7 +221,7 @@ async fn response_connect(ctx: &mut RtmpContext) -> BoxResult<()> {
         // 0-Hard, 1-Soft, 2-Dynamic
         set_peer_bandwidth.push(0x01);
 
-        ctx.write(&set_peer_bandwidth).await?;
+        ctx.write_to_stream(&set_peer_bandwidth).await?;
         log::info!("S->C, set_peer_bandwidth:");
         print_hex(set_peer_bandwidth.to_vec().as_ref());
     }
@@ -281,7 +232,7 @@ async fn response_connect(ctx: &mut RtmpContext) -> BoxResult<()> {
             0x00, 0x00, 0x04, 0x01,
             0x00, 0x00, 0x00, 0x00];
         set_chunk_size.append(&mut ctx.chunk_size.to_be_bytes().to_vec());
-        ctx.write(set_chunk_size.as_ref()).await?;
+        ctx.write_to_stream(set_chunk_size.as_ref()).await?;
         log::info!("S->C, set_chunk_size:");
         print_hex(set_chunk_size.to_vec().as_ref());
     }
@@ -325,7 +276,7 @@ async fn response_connect(ctx: &mut RtmpContext) -> BoxResult<()> {
             ],
         }.write_to(&mut response_result)?;
         response_result[6] = (response_result.len() - 12) as u8;
-        ctx.write(response_result.as_ref()).await?;
+        ctx.write_to_stream(response_result.as_ref()).await?;
         log::info!("S->C, response_result:");
         print_hex(response_result.as_ref());
     }
@@ -333,21 +284,21 @@ async fn response_connect(ctx: &mut RtmpContext) -> BoxResult<()> {
     Ok(())
 }
 
-async fn response_create_stream(ctx: &mut RtmpContext, prev_command_number: &amf::amf0::Value) -> BoxResult<()> {
+async fn response_create_stream(ctx: &mut RtmpContext, prev_command_number: &amf::amf0::Value) -> anyhow::Result<()> {
     let mut response_result: Vec<u8> = vec![0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x14, 0x00, 0x00, 0x00, 0x00, ];
     amf::amf0::Value::String("_result".to_string()).write_to(&mut response_result)?;
     prev_command_number.write_to(&mut response_result)?;
     amf::amf0::Value::Null.write_to(&mut response_result)?;
     amf::amf0::Value::Number(9.0).write_to(&mut response_result)?;
     response_result[6] = (response_result.len() - 12) as u8;
-    ctx.write(response_result.as_ref()).await?;
+    ctx.write_to_stream(response_result.as_ref()).await?;
     log::info!("S->C, response_result:");
     print_hex(response_result.as_ref());
 
     Ok(())
 }
 
-async fn response_publish(ctx: &mut RtmpContext) -> BoxResult<()> {
+async fn response_publish(ctx: &mut RtmpContext) -> anyhow::Result<()> {
     let mut response_result: Vec<u8> = vec![0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x28, 0x14, 0x00, 0x00, 0x00, 0x01, ];
     amf::amf0::Value::String("onStatus".to_string()).write_to(&mut response_result)?;
     amf::amf0::Value::Number(1.0).write_to(&mut response_result)?;
@@ -370,14 +321,14 @@ async fn response_publish(ctx: &mut RtmpContext) -> BoxResult<()> {
         ],
     }.write_to(&mut response_result)?;
     response_result[6] = (response_result.len() - 12) as u8;
-    ctx.write(response_result.as_ref()).await?;
+    ctx.write_to_stream(response_result.as_ref()).await?;
     log::info!("S->C, Start publishing:");
     print_hex(response_result.as_ref());
 
     Ok(())
 }
 
-async fn response_play(ctx: &mut RtmpContext, stream_id: u32) -> BoxResult<()> {
+async fn response_play(ctx: &mut RtmpContext, stream_id: u32) -> anyhow::Result<()> {
     {
         let mut rs: Vec<u8> = vec![
             0x02, 0x00, 0x00, 0x00,
@@ -388,7 +339,7 @@ async fn response_play(ctx: &mut RtmpContext, stream_id: u32) -> BoxResult<()> {
         ];
         let x: [u8; 4] = stream_id.to_be_bytes();
         rs.append(&mut x.to_vec());
-        ctx.write(rs.as_ref()).await?;
+        ctx.write_to_stream(rs.as_ref()).await?;
         log::info!("S->C, Stream Begin, streamId={}", &stream_id);
     }
 
@@ -419,7 +370,7 @@ async fn response_play(ctx: &mut RtmpContext, stream_id: u32) -> BoxResult<()> {
             ],
         }.write_to(&mut response_result)?;
         response_result[6] = (response_result.len() - 12) as u8;
-        ctx.write(response_result.as_ref()).await?;
+        ctx.write_to_stream(response_result.as_ref()).await?;
         log::info!("S->C, Start play:");
         print_hex(response_result.as_ref());
     }
@@ -434,28 +385,15 @@ async fn response_play(ctx: &mut RtmpContext, stream_id: u32) -> BoxResult<()> {
         amf::amf0::Value::Boolean(true).write_to(&mut response_result)?;
         amf::amf0::Value::Boolean(true).write_to(&mut response_result)?;
         response_result[6] = (response_result.len() - 12) as u8;
-        ctx.write(response_result.as_ref()).await?;
+        ctx.write_to_stream(response_result.as_ref()).await?;
         log::info!("S->C, Start play:");
         print_hex(response_result.as_ref());
     }
     Ok(())
 }
 
-// async fn send_ack(stream: &mut TcpStream, ctx: &mut RtmpContext) -> BoxResult<()> {
-//     let mut ack_frame = vec![
-//         0x02, 0x00, 0x00, 0x00,
-//         0x00, 0x00, 0x04, 0x03,
-//         0x00, 0x00, 0x00, 0x00,
-//     ];
-//     let mut ack_frame_body: [u8; 4] = ctx.recv_bytes_num.to_be_bytes();
-//     ack_frame.append(&mut ack_frame_body.to_vec());
-//     stream.write_all(&ack_frame).await?;
-//
-//     Ok(())
-// }
-
-fn main() -> BoxResult<()> {
-    init_logger();
+fn main() -> anyhow::Result<()> {
+    util::init_logger();
     let server = "127.0.0.1:1935";
     smol::block_on(accept_loop(server))
 }

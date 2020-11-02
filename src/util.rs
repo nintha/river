@@ -1,26 +1,22 @@
-use async_trait::async_trait;
-use super::BoxResult;
-use smol::net::TcpStream;
-use smol::io::AsyncReadExt;
+use chrono::Local;
+use std::io::Write;
 
-#[async_trait]
-pub trait TcpStreamExtend {
-    /// blocking read some bytes from `TcpStream`
-    async fn read_exact_return(&mut self, bytes_num: u32) -> BoxResult<Vec<u8>>;
-    /// blocking read one byte from `TcpStream`
-    async fn read_one_return(&mut self) -> BoxResult<u8> {
-        self.read_exact_return(1).await.map(|v| v[0])
-    }
-}
-
-#[async_trait]
-impl TcpStreamExtend for TcpStream {
-    /// blocking read some bytes from `TcpStream`
-    async fn read_exact_return(&mut self, bytes_num: u32) -> BoxResult<Vec<u8>> {
-        let mut data = vec![0u8; bytes_num as usize];
-        self.read_exact(&mut data).await?;
-        return Ok(data);
-    }
+pub fn init_logger() {
+    let env = env_logger::Env::default()
+        .filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
+    // 设置日志打印格式
+    env_logger::Builder::from_env(env)
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} {} - {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                buf.default_styled_level(record.level()),
+                &record.args()
+            )
+        })
+        .init();
+    log::info!("env_logger initialized.");
 }
 
 pub fn bytes_hex_format(bytes: &[u8]) -> String {

@@ -8,8 +8,8 @@ use num::FromPrimitive;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::TcpStream;
 
-use crate::BoxResult;
-use crate::extension::{bytes_hex_format, print_hex};
+use crate::util::{bytes_hex_format};
+use smol::channel::{Receiver, Sender};
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -102,10 +102,31 @@ pub struct RtmpContext {
     pub chunk_size: u32,
     pub remain_message_length: u32,
     pub recv_bytes_num: u32,
+    nalu_tx: Sender<Vec<u8>>,
 }
 
 impl RtmpContext {
     pub fn new(stream: TcpStream) -> Self {
+        let (nalu_tx, nalu_rx) = smol::channel::unbounded::<Vec<u8>>();
+
+        async fn handle_nalu_rx(nalu_rx: Receiver<Vec<u8>>) -> anyhow::Result<()> {
+            let mut file = smol::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open("output.h264")
+                .await?;
+            while let Ok(bytes) = nalu_rx.recv().await {
+                file.write_all(&bytes).await?;
+            }
+            Ok(())
+        }
+        smol::spawn(async move {
+            if let Err(e) = handle_nalu_rx(nalu_rx).await {
+                log::error!("handle_nalu_rx error, {:?}", e);
+            }
+        }).detach();
+
         RtmpContext {
             stream,
             ctx_begin_timestamp: Local::now().timestamp_millis(),
@@ -117,17 +138,23 @@ impl RtmpContext {
             chunk_size: 128,
             remain_message_length: 0,
             recv_bytes_num: 0,
+            nalu_tx,
         }
     }
 
-    pub async fn read_exact_return(&mut self, bytes_num: u32) -> anyhow::Result<Vec<u8>> {
+    pub async fn read_exact_from_stream(&mut self, bytes_num: u32) -> anyhow::Result<Vec<u8>> {
         let mut data = vec![0u8; bytes_num as usize];
         AsyncReadExt::read_exact(&mut self.stream, &mut data).await?;
         Ok(data)
     }
 
-    pub async fn write(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+    pub async fn write_to_stream(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.stream.write_all(bytes).await?;
+        Ok(())
+    }
+
+    pub async fn write_file(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.nalu_tx.send(bytes).await?;
         Ok(())
     }
 }
@@ -164,7 +191,7 @@ pub struct RtmpMessage {
 
 impl RtmpMessage {
     /// 读取完整消息
-    pub async fn read_from(ctx: &mut RtmpContext) -> BoxResult<Self> {
+    pub async fn read_from(ctx: &mut RtmpContext) -> anyhow::Result<Self> {
         let mut chunk = RtmpMessage::read_chunk_from(ctx).await?;
         while ctx.remain_message_length > 0 {
             let mut remain_chunk = RtmpMessage::read_chunk_from(ctx).await?;
@@ -176,14 +203,14 @@ impl RtmpMessage {
     }
 
     /// 读取一个消息分片
-    async fn read_chunk_from(ctx: &mut RtmpContext) -> BoxResult<Self> {
-        let one = ctx.read_exact_return(1).await?[0];
+    async fn read_chunk_from(ctx: &mut RtmpContext) -> anyhow::Result<Self> {
+        let one = ctx.read_exact_from_stream(1).await?[0];
         let fmt = one >> 6;
         let csid = one << 2 >> 2;
         let (timestamp, message_length, message_type_id, message_stream_id) = match fmt {
             0 => {
-                let h = ctx.read_exact_return(11).await?;
-                print_hex(&h);
+                let h = ctx.read_exact_from_stream(11).await?;
+                // print_hex(&h);
                 // 时间差值置零
                 ctx.last_timestamp_delta = 0;
                 ctx.last_timestamp = BigEndian::read_u24(&h[0..3]);
@@ -199,7 +226,7 @@ impl RtmpMessage {
                  ctx.last_message_stream_id)
             }
             1 => {
-                let h = ctx.read_exact_return(7).await?;
+                let h = ctx.read_exact_from_stream(7).await?;
                 // bytes_hex_format(&h);
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
@@ -214,7 +241,7 @@ impl RtmpMessage {
                  ctx.last_message_stream_id)
             }
             2 => {
-                let h = ctx.read_exact_return(3).await?;
+                let h = ctx.read_exact_from_stream(3).await?;
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_timestamp_delta = timestamp_delta;
                 ctx.last_timestamp += timestamp_delta;
@@ -251,7 +278,7 @@ impl RtmpMessage {
                 remain_length
             }
         };
-        let message_data = ctx.read_exact_return(read_num).await?;
+        let message_data = ctx.read_exact_from_stream(read_num).await?;
         ctx.recv_bytes_num += read_num;
 
         let message_type = FromPrimitive::from_u8(message_type_id)
@@ -365,7 +392,7 @@ pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
         Value::Number(_) => 9,
         Value::Boolean(_) => 2,
         Value::String(s) => (s.len() + 3),
-        Value::Object { class_name, entries } => {
+        Value::Object { entries, .. } => {
             // marker and tail
             let mut len = 4;
             for en in entries {
@@ -412,29 +439,92 @@ pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
     Some(list)
 }
 
-pub fn print_video_data(bytes: &[u8]) {
+
+/// # VideoTagHeader
+///
+/// ## Frame Type
+///
+/// Type: UB [4]
+///
+/// Type of video frame. The following values are defined:
+/// 1 = key frame (for AVC, a seekable frame)
+/// 2 = inter frame (for AVC, a non-seekable frame)
+/// 3 = disposable inter frame (H.263 only)
+/// 4 = generated key frame (reserved for server use only)
+/// 5 = video info/command frame
+///
+/// ## CodecID
+///
+/// Type: UB [4]
+///
+/// Codec Identifier. The following values are defined:
+/// 2 = Sorenson H.263
+/// 3 = Screen video
+/// 4 = On2 VP6
+/// 5 = On2 VP6 with alpha channel
+/// 6 = Screen video version 2
+/// 7 = AVC
+///
+/// ## AVCPacketType
+///
+/// Type: IF CodecID == 7, UI8
+///
+/// The following values are defined:
+/// 0 = AVC sequence header
+/// 1 = AVC NALU
+/// 2 = AVC end of sequence (lower level NALU sequence ender is not required or supported)
+///
+/// ## CompositionTime
+///
+/// Type: IF CodecID == 7, SI24
+///
+/// IF AVCPacketType == 1
+///     Composition time offset
+/// ELSE
+///     0
+/// See ISO 14496-12, 8.15.3 for an explanation of composition
+/// times. The offset in an FLV file is always in milliseconds.
+pub fn print_video_data(ctx: &mut RtmpContext, bytes: &[u8]) {
     let frame_type = bytes[0];
-    log::info!("video frame type = {:#04X}", frame_type);
     let mut read_index = 1;
     let acv_packet_type = bytes[read_index];
     read_index += 1;
 
-    let data_len = if acv_packet_type == 0 {
-        let composition_time_offset = &bytes[read_index..read_index + 3];
-        read_index += 3;
-        let avc_profile = &bytes[read_index..read_index + 4];
+    // AVC时，全0，无意义（作业时间）
+    let _composition_time_offset = &bytes[read_index..read_index + 3];
+    read_index += 3;
+
+    log::info!("video frame type = {:#04X}, acv_packet_type={:#04X}", frame_type, acv_packet_type);
+
+    // AVCDecoderConfigurationRecord（AVC sequence header）
+    if acv_packet_type == 0 {
+        let config_version = &bytes[read_index];
+        let avc_profile_indication = &bytes[read_index + 1];
+        let profile_compatibility = &bytes[read_index + 2];
+        let avc_level_indication = &bytes[read_index + 3];
         read_index += 4;
         let length_size_minus_one = &bytes[read_index];
         read_index += 1;
-        let num_of_sps = &bytes[read_index] & 0x1F;
+        let sps_num = &bytes[read_index] & 0x1F;
         read_index += 1;
-        println!("sps num = {}", num_of_sps);
-        for _ in 0..num_of_sps as usize {
+        println!("sps_num={}", sps_num);
+        println!("config_version={:#04X}", config_version);
+        println!("avc_profile_indication={:#04X}", avc_profile_indication);
+        println!("profile_compatibility={:#04X}", profile_compatibility);
+        println!("avc_level_indication={:#04X}", avc_level_indication);
+        println!("length_size_minus_one={:#04X}", length_size_minus_one);
+        for _ in 0..sps_num as usize {
             let data_len = BigEndian::read_u16(&bytes[read_index..]);
             read_index += 2;
             let data = &bytes[read_index..(read_index + data_len as usize)];
             read_index += data_len as usize;
             println!("len={}, sps data:\n{}", data_len, bytes_hex_format(data));
+
+            let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
+            nalu_bytes.extend_from_slice(data);
+            if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
+                log::error!("write_file error, {:?}", e);
+            }
         }
         let num_of_pps = &bytes[read_index] & 0x1F;
         read_index += 1;
@@ -445,10 +535,16 @@ pub fn print_video_data(bytes: &[u8]) {
             let data = &bytes[read_index..(read_index + data_len as usize)];
             read_index += data_len as usize;
             println!("len={}, pps data:\n{}", data_len, bytes_hex_format(data));
+
+            let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
+            nalu_bytes.extend_from_slice(data);
+            if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
+                log::error!("write_file error, {:?}", e);
+            }
         }
-    } else {
-        let composition_time_offset = &bytes[read_index..read_index + 3];
-        read_index += 3;
+    }
+    // One or more NALUs (Full frames are required)
+    else if acv_packet_type == 1 {
         loop {
             if read_index >= bytes.len() {
                 break;
@@ -457,9 +553,17 @@ pub fn print_video_data(bytes: &[u8]) {
             read_index += 4;
             let data = &bytes[read_index..(read_index + data_len as usize)];
             read_index += data_len as usize;
-            // println!("NALU Type: {}, len={}", nalu_type_desc(&data[0]), data_len);
-            println!("len={}, nalu data:\n{}", data_len, bytes_hex_format(data));
+            println!("NALU Type: {}, len={}", nalu_type_desc(&data[0]), data_len);
+            // println!("len={}, nalu data:\n{}", data_len, bytes_hex_format(data));
+
+            let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x01];
+            nalu_bytes.extend_from_slice(data);
+            if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
+                log::error!("write_file error, {:?}", e);
+            }
         }
+    } else {
+        unreachable!("unknown acv packet type")
     };
 }
 
