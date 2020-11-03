@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 pub struct Nalu {
     data: Vec<u8>,
 }

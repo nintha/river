@@ -1,36 +1,28 @@
 #[macro_use]
 extern crate num_derive;
+
 use amf::amf0::Value;
 use amf::Pair;
 use byteorder::{BigEndian, ByteOrder};
 use chrono::Local;
-use rand::Rng;
 use smol::net::{TcpListener, TcpStream};
 use smol::prelude::*;
 
 use protocol::rtmp::*;
 
-use crate::util::{bytes_hex_format, print_hex};
+use crate::util::{bytes_hex_format, print_hex, spawn_and_log_error, gen_random_bytes};
+use crate::eventbus::EventBus;
+use once_cell::sync::OnceCell;
 
 mod util;
 mod protocol;
+mod eventbus;
 
-/// 执行一个新协程，并且在错误时打印错误信息
-fn spawn_and_log_error<F>(fut: F) where F: Future<Output=anyhow::Result<()>> + Send + 'static {
-    smol::spawn(async move {
-        if let Err(e) = fut.await {
-            log::error!("spawn future error, {:?}", e)
-        }
-    }).detach();
-}
-
-fn gen_random_bytes(len: u32) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
-    let mut vec = Vec::new();
-    for _ in 0..len {
-        vec.push(rng.gen());
-    }
-    vec
+fn global_eventbus() -> &'static EventBus<Vec<u8>> {
+    static INSTANCE: OnceCell<EventBus<Vec<u8>>> = OnceCell::new();
+    INSTANCE.get_or_init(|| {
+        EventBus::with_label("GLOBAL")
+    })
 }
 
 /// TCP 连接处理
@@ -113,13 +105,11 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                         log::info!("C->S, [{}] part: {:?}", command, v);
                     }
                 }
-                // sender.send(message).await?;
             }
 
             ChunkMessageType::VideoMessage => {
-                log::info!("C->S, [{}] header={:?}", message.message_type_desc(), message.header);
-                print_video_data(&mut ctx, &message.body);
-                // sender.send(message).await?;
+                log::debug!("C->S, [{}] header={:?}", message.message_type_desc(), message.header);
+                handle_video_data(&message.body);
             }
             ChunkMessageType::AudioMessage => {
                 // sender.send(message).await?;

@@ -1,5 +1,7 @@
 use chrono::Local;
 use std::io::Write;
+use std::future::Future;
+use rand::Rng;
 
 pub fn init_logger() {
     let env = env_logger::Env::default()
@@ -71,4 +73,23 @@ pub fn bytes_hex_format(bytes: &[u8]) -> String {
 
 pub fn print_hex(bytes: &[u8]) {
     println!("{}", bytes_hex_format(bytes));
+}
+
+/// 执行一个新协程，并且在错误时打印错误信息
+pub fn spawn_and_log_error<F>(fut: F) where F: Future<Output=anyhow::Result<()>> + Send + 'static {
+    smol::spawn(async move {
+        if let Err(e) = fut.await {
+            log::error!("spawn future error, {:?}", e)
+        }
+    }).detach();
+}
+
+/// 生成随机字节数组
+pub fn gen_random_bytes(len: u32) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+    let mut vec = Vec::new();
+    for _ in 0..len {
+        vec.push(rng.gen());
+    }
+    vec
 }

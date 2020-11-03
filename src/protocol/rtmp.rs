@@ -8,8 +8,12 @@ use num::FromPrimitive;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::TcpStream;
 
-use crate::util::{bytes_hex_format};
-use smol::channel::{Receiver, Sender};
+use crate::util::{bytes_hex_format, spawn_and_log_error};
+use smol::channel::{Receiver};
+use crate::global_eventbus;
+use std::sync::{Arc, Weak};
+use smol_timeout::TimeoutExt;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -102,30 +106,40 @@ pub struct RtmpContext {
     pub chunk_size: u32,
     pub remain_message_length: u32,
     pub recv_bytes_num: u32,
-    nalu_tx: Sender<Vec<u8>>,
+    pub arc_receiver: Arc<Receiver<Vec<u8>>>,
 }
 
 impl RtmpContext {
     pub fn new(stream: TcpStream) -> Self {
-        let (nalu_tx, nalu_rx) = smol::channel::unbounded::<Vec<u8>>();
+        let receiver = global_eventbus().register_receiver();
+        let receiver = Arc::new(receiver);
+        let nalu_rx_weak = Arc::downgrade(&receiver);
 
-        async fn handle_nalu_rx(nalu_rx: Receiver<Vec<u8>>) -> anyhow::Result<()> {
+        async fn handle_nalu_rx(nalu_rx: Weak<Receiver<Vec<u8>>>) -> anyhow::Result<()> {
+            let tmp_dir = "tmp";
+            if smol::fs::read_dir(tmp_dir).await.is_err() {
+                smol::fs::create_dir_all(tmp_dir).await?;
+            }
+
             let mut file = smol::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open("output.h264")
+                .open("tmp/output.h264")
                 .await?;
-            while let Ok(bytes) = nalu_rx.recv().await {
-                file.write_all(&bytes).await?;
+
+            while let Some(rx) = nalu_rx.upgrade() {
+                if let Some(Ok(bytes)) = rx.recv().timeout(Duration::from_secs(1)).await {
+                    file.write_all(&bytes).await?;
+                } else {
+                    break;
+                }
             }
+            log::warn!("handle_nalu_rx closed");
             Ok(())
         }
-        smol::spawn(async move {
-            if let Err(e) = handle_nalu_rx(nalu_rx).await {
-                log::error!("handle_nalu_rx error, {:?}", e);
-            }
-        }).detach();
+
+        spawn_and_log_error(handle_nalu_rx(nalu_rx_weak));
 
         RtmpContext {
             stream,
@@ -138,7 +152,7 @@ impl RtmpContext {
             chunk_size: 128,
             remain_message_length: 0,
             recv_bytes_num: 0,
-            nalu_tx,
+            arc_receiver: receiver,
         }
     }
 
@@ -150,11 +164,6 @@ impl RtmpContext {
 
     pub async fn write_to_stream(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.stream.write_all(bytes).await?;
-        Ok(())
-    }
-
-    pub async fn write_file(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
-        self.nalu_tx.send(bytes).await?;
         Ok(())
     }
 }
@@ -484,7 +493,7 @@ pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
 ///     0
 /// See ISO 14496-12, 8.15.3 for an explanation of composition
 /// times. The offset in an FLV file is always in milliseconds.
-pub fn print_video_data(ctx: &mut RtmpContext, bytes: &[u8]) {
+pub fn handle_video_data(bytes: &[u8]) {
     let frame_type = bytes[0];
     let mut read_index = 1;
     let acv_packet_type = bytes[read_index];
@@ -522,9 +531,7 @@ pub fn print_video_data(ctx: &mut RtmpContext, bytes: &[u8]) {
 
             let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
             nalu_bytes.extend_from_slice(data);
-            if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
-                log::error!("write_file error, {:?}", e);
-            }
+            handle_nalu(nalu_bytes);
         }
         let num_of_pps = &bytes[read_index] & 0x1F;
         read_index += 1;
@@ -538,9 +545,7 @@ pub fn print_video_data(ctx: &mut RtmpContext, bytes: &[u8]) {
 
             let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
             nalu_bytes.extend_from_slice(data);
-            if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
-                log::error!("write_file error, {:?}", e);
-            }
+            handle_nalu(nalu_bytes);
         }
     }
     // One or more NALUs (Full frames are required)
@@ -558,13 +563,18 @@ pub fn print_video_data(ctx: &mut RtmpContext, bytes: &[u8]) {
 
             let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x01];
             nalu_bytes.extend_from_slice(data);
-            if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
-                log::error!("write_file error, {:?}", e);
-            }
+            handle_nalu(nalu_bytes);
         }
     } else {
         unreachable!("unknown acv packet type")
     };
+}
+
+fn handle_nalu(nalu_bytes: Vec<u8>) {
+    smol::block_on(global_eventbus().publish(nalu_bytes));
+    // if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
+    //     log::error!("write_file error, {:?}", e);
+    // }
 }
 
 fn nalu_type_desc(nalu_type: &u8) -> String {
