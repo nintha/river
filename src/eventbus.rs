@@ -3,15 +3,15 @@ use dashmap::DashMap;
 use crossbeam_utils::atomic::AtomicCell;
 
 pub struct EventBus<E> {
-    label: String,
+    label: &'static str,
     incr_val: AtomicCell<u64>,
     tx_map: DashMap<u64, Sender<E>>,
 }
 
 impl<E: 'static + Clone> EventBus<E> {
-    pub fn with_label(label: impl ToString) -> Self {
+    pub fn with_label(label: &'static str) -> Self {
         Self {
-            label: label.to_string(),
+            label,
             incr_val: Default::default(),
             tx_map: Default::default(),
         }
@@ -19,9 +19,14 @@ impl<E: 'static + Clone> EventBus<E> {
 
     pub async fn publish(&self, val: E) {
         let mut dropped_senders: Vec<u64> = vec![];
-        for el in self.tx_map.iter() {
-            if let Err(_) = el.send(val.clone()).await {
-                dropped_senders.push(*el.key());
+
+        let keys: Vec<u64> = self.tx_map.iter().map(|x| x.key().to_owned()).collect();
+
+        for key in keys {
+            if let Some(entry) = self.tx_map.get(&key) {
+                if let Err(_) = entry.send(val.clone()).await {
+                    dropped_senders.push(key);
+                }
             }
         }
         for key in dropped_senders.iter() {

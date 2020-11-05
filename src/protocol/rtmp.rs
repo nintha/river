@@ -10,7 +10,7 @@ use smol::net::TcpStream;
 
 use crate::util::{bytes_hex_format, spawn_and_log_error};
 use smol::channel::{Receiver};
-use crate::global_eventbus;
+use crate::nalu_eventbus;
 use std::sync::{Arc, Weak};
 use smol_timeout::TimeoutExt;
 use std::time::Duration;
@@ -107,15 +107,17 @@ pub struct RtmpContext {
     pub remain_message_length: u32,
     pub recv_bytes_num: u32,
     pub arc_receiver: Arc<Receiver<Vec<u8>>>,
+    pub peer_addr: String,
 }
 
 impl RtmpContext {
     pub fn new(stream: TcpStream) -> Self {
-        let receiver = global_eventbus().register_receiver();
+        let receiver = nalu_eventbus().register_receiver();
         let receiver = Arc::new(receiver);
         let nalu_rx_weak = Arc::downgrade(&receiver);
+        let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
 
-        async fn handle_nalu_rx(nalu_rx: Weak<Receiver<Vec<u8>>>) -> anyhow::Result<()> {
+        async fn handle_nalu_rx(nalu_rx: Weak<Receiver<Vec<u8>>>, peer_addr: String) -> anyhow::Result<()> {
             let tmp_dir = "tmp";
             if smol::fs::read_dir(tmp_dir).await.is_err() {
                 smol::fs::create_dir_all(tmp_dir).await?;
@@ -129,17 +131,19 @@ impl RtmpContext {
                 .await?;
 
             while let Some(rx) = nalu_rx.upgrade() {
-                if let Some(Ok(bytes)) = rx.recv().timeout(Duration::from_secs(1)).await {
-                    file.write_all(&bytes).await?;
-                } else {
-                    break;
+                if let Some(rs) = rx.recv().timeout(Duration::from_secs(1)).await {
+                    if let Ok(bytes) = rs {
+                        file.write_all(&bytes).await?;
+                    } else {
+                        break;
+                    }
                 }
             }
-            log::warn!("handle_nalu_rx closed");
+            log::warn!("[peer={}][handle_nalu_rx] closed", peer_addr);
             Ok(())
         }
 
-        spawn_and_log_error(handle_nalu_rx(nalu_rx_weak));
+        spawn_and_log_error(handle_nalu_rx(nalu_rx_weak, peer_addr.clone()));
 
         RtmpContext {
             stream,
@@ -153,22 +157,23 @@ impl RtmpContext {
             remain_message_length: 0,
             recv_bytes_num: 0,
             arc_receiver: receiver,
+            peer_addr,
         }
     }
 
-    pub async fn read_exact_from_stream(&mut self, bytes_num: u32) -> anyhow::Result<Vec<u8>> {
+    pub async fn read_exact_from_peer(&mut self, bytes_num: u32) -> anyhow::Result<Vec<u8>> {
         let mut data = vec![0u8; bytes_num as usize];
         AsyncReadExt::read_exact(&mut self.stream, &mut data).await?;
         Ok(data)
     }
 
-    pub async fn write_to_stream(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+    pub async fn write_to_peer(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.stream.write_all(bytes).await?;
         Ok(())
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RtmpMessageHeader {
     /// chunk stream id
     /// 2 (low level), 3 (high level), 4 (control stream), 5 (video) and 6 (audio).
@@ -178,6 +183,8 @@ pub struct RtmpMessageHeader {
     pub message_type_id: u8,
     pub message_type: ChunkMessageType,
     /// message stream id
+    /// 0 => 信令,
+    /// 1 => play 信令| publish 信令 | 音视频数据
     pub msid: u32,
 }
 
@@ -192,6 +199,7 @@ impl RtmpMessageHeader {
     }
 }
 
+#[derive(Clone)]
 pub struct RtmpMessage {
     pub header: RtmpMessageHeader,
     pub body: Vec<u8>,
@@ -213,12 +221,12 @@ impl RtmpMessage {
 
     /// 读取一个消息分片
     async fn read_chunk_from(ctx: &mut RtmpContext) -> anyhow::Result<Self> {
-        let one = ctx.read_exact_from_stream(1).await?[0];
+        let one = ctx.read_exact_from_peer(1).await?[0];
         let fmt = one >> 6;
         let csid = one << 2 >> 2;
         let (timestamp, message_length, message_type_id, message_stream_id) = match fmt {
             0 => {
-                let h = ctx.read_exact_from_stream(11).await?;
+                let h = ctx.read_exact_from_peer(11).await?;
                 // print_hex(&h);
                 // 时间差值置零
                 ctx.last_timestamp_delta = 0;
@@ -235,7 +243,7 @@ impl RtmpMessage {
                  ctx.last_message_stream_id)
             }
             1 => {
-                let h = ctx.read_exact_from_stream(7).await?;
+                let h = ctx.read_exact_from_peer(7).await?;
                 // bytes_hex_format(&h);
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
@@ -250,7 +258,7 @@ impl RtmpMessage {
                  ctx.last_message_stream_id)
             }
             2 => {
-                let h = ctx.read_exact_from_stream(3).await?;
+                let h = ctx.read_exact_from_peer(3).await?;
                 let timestamp_delta = BigEndian::read_u24(&h[0..3]);
                 ctx.last_timestamp_delta = timestamp_delta;
                 ctx.last_timestamp += timestamp_delta;
@@ -287,7 +295,7 @@ impl RtmpMessage {
                 remain_length
             }
         };
-        let message_data = ctx.read_exact_from_stream(read_num).await?;
+        let message_data = ctx.read_exact_from_peer(read_num).await?;
         ctx.recv_bytes_num += read_num;
 
         let message_type = FromPrimitive::from_u8(message_type_id)
@@ -308,23 +316,23 @@ impl RtmpMessage {
 
     pub fn message_type_desc(&self) -> String {
         match self.header.message_type_id {
-            1 => "ProtocolControlMessages::SetChunkSize".into(),
-            2 => "ProtocolControlMessages::AbortMessage".into(),
-            3 => "ProtocolControlMessages::Acknowledgement".into(),
-            4 => "ProtocolControlMessages::UserControlMessage".into(),
-            5 => "ProtocolControlMessages::WindowAcknowledgementSize".into(),
-            6 => "ProtocolControlMessages::SetPeerBandwidth".into(),
-            17 => "CommandMessages::AMF3CommandMessage".into(),
-            20 => "CommandMessages::AMF0CommandMessage".into(),
-            15 => "CommandMessages::AMF3DataMessage".into(),
-            18 => "CommandMessages::AMF0DataMessage".into(),
-            16 => "CommandMessages::AMF3SharedObjectMessage".into(),
-            19 => "CommandMessages::AMF0SharedObjectMessage".into(),
-            8 => "CommandMessages::AudioMessage".into(),
-            9 => "CommandMessages::VideoMessage".into(),
-            22 => "CommandMessages::AggregateMessage".into(),
-            _ => "UnknownMessage".into(),
-        }
+            1 => "ProtocolControlMessages::SetChunkSize",
+            2 => "ProtocolControlMessages::AbortMessage",
+            3 => "ProtocolControlMessages::Acknowledgement",
+            4 => "ProtocolControlMessages::UserControlMessage",
+            5 => "ProtocolControlMessages::WindowAcknowledgementSize",
+            6 => "ProtocolControlMessages::SetPeerBandwidth",
+            17 => "CommandMessages::AMF3CommandMessage",
+            20 => "CommandMessages::AMF0CommandMessage",
+            15 => "CommandMessages::AMF3DataMessage",
+            18 => "CommandMessages::AMF0DataMessage",
+            16 => "CommandMessages::AMF3SharedObjectMessage",
+            19 => "CommandMessages::AMF0SharedObjectMessage",
+            8 => "CommandMessages::AudioMessage",
+            9 => "CommandMessages::VideoMessage",
+            22 => "CommandMessages::AggregateMessage",
+            _ => "UnknownMessage",
+        }.to_string()
     }
 
     /// 把body数据解析成amf0格式
@@ -335,7 +343,8 @@ impl RtmpMessage {
         }
     }
 
-    pub fn split_chunks_bytes(&self, chunk_size: u32, msid: u32) -> Vec<Vec<u8>> {
+    /// 把一个长message分离成多个chunk，第一个chunk的type=0，后续的type=3
+    pub fn split_chunks_bytes(&self, chunk_size: u32) -> Vec<Vec<u8>> {
         let chunk_size = chunk_size as usize;
         let mut rs = vec![];
 
@@ -348,10 +357,7 @@ impl RtmpMessage {
         rs.push(remain);
 
         // 添加type0头部
-        for item in msid.to_be_bytes().iter().rev() {
-            (&mut rs[0]).insert(0, item.clone());
-        }
-        for item in self.header.to_bytes()[0..8].iter().rev() {
+        for item in self.header.to_bytes().iter().rev() {
             (&mut rs[0]).insert(0, item.clone());
         }
 
@@ -377,7 +383,7 @@ impl Debug for RtmpMessage {
     }
 }
 
-#[derive(Debug, PartialEq, FromPrimitive)]
+#[derive(Debug, PartialEq, FromPrimitive, Clone, Copy)]
 pub enum ChunkMessageType {
     SetChunkSize = 1,
     AbortMessage = 2,
@@ -394,6 +400,17 @@ pub enum ChunkMessageType {
     AudioMessage = 8,
     VideoMessage = 9,
     AggregateMessage = 22,
+}
+
+pub struct RtmpMetaData {
+    pub width: f64,
+    pub height: f64,
+    pub video_codec_id: String,
+    pub video_data_rate: f64,
+    pub audio_codec_id: String,
+    pub audio_data_rate: f64,
+    pub frame_rate: f64,
+    pub duration: f64,
 }
 
 pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
@@ -493,7 +510,7 @@ pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
 ///     0
 /// See ISO 14496-12, 8.15.3 for an explanation of composition
 /// times. The offset in an FLV file is always in milliseconds.
-pub fn handle_video_data(bytes: &[u8]) {
+pub fn handle_video_data(bytes: &[u8], ctx: &RtmpContext) {
     let frame_type = bytes[0];
     let mut read_index = 1;
     let acv_packet_type = bytes[read_index];
@@ -503,31 +520,30 @@ pub fn handle_video_data(bytes: &[u8]) {
     let _composition_time_offset = &bytes[read_index..read_index + 3];
     read_index += 3;
 
-    log::info!("video frame type = {:#04X}, acv_packet_type={:#04X}", frame_type, acv_packet_type);
+    log::debug!("[peer={}] video frame type = {:#04X}, acv_packet_type={:#04X}", &ctx.peer_addr, frame_type, acv_packet_type);
 
     // AVCDecoderConfigurationRecord（AVC sequence header）
     if acv_packet_type == 0 {
-        let config_version = &bytes[read_index];
-        let avc_profile_indication = &bytes[read_index + 1];
-        let profile_compatibility = &bytes[read_index + 2];
-        let avc_level_indication = &bytes[read_index + 3];
-        read_index += 4;
-        let length_size_minus_one = &bytes[read_index];
-        read_index += 1;
+        // let config_version = &bytes[read_index];
+        // let avc_profile_indication = &bytes[read_index + 1];
+        // let profile_compatibility = &bytes[read_index + 2];
+        // let avc_level_indication = &bytes[read_index + 3];
+        // let length_size_minus_one = &bytes[read_index + 4];
+        read_index += 5;
         let sps_num = &bytes[read_index] & 0x1F;
         read_index += 1;
-        println!("sps_num={}", sps_num);
-        println!("config_version={:#04X}", config_version);
-        println!("avc_profile_indication={:#04X}", avc_profile_indication);
-        println!("profile_compatibility={:#04X}", profile_compatibility);
-        println!("avc_level_indication={:#04X}", avc_level_indication);
-        println!("length_size_minus_one={:#04X}", length_size_minus_one);
+        // println!("sps_num={}", sps_num);
+        // println!("config_version={:#04X}", config_version);
+        // println!("avc_profile_indication={:#04X}", avc_profile_indication);
+        // println!("profile_compatibility={:#04X}", profile_compatibility);
+        // println!("avc_level_indication={:#04X}", avc_level_indication);
+        // println!("length_size_minus_one={:#04X}", length_size_minus_one);
         for _ in 0..sps_num as usize {
             let data_len = BigEndian::read_u16(&bytes[read_index..]);
             read_index += 2;
             let data = &bytes[read_index..(read_index + data_len as usize)];
             read_index += data_len as usize;
-            println!("len={}, sps data:\n{}", data_len, bytes_hex_format(data));
+            // println!("len={}, sps data:\n{}", data_len, bytes_hex_format(data));
 
             let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
             nalu_bytes.extend_from_slice(data);
@@ -535,13 +551,13 @@ pub fn handle_video_data(bytes: &[u8]) {
         }
         let num_of_pps = &bytes[read_index] & 0x1F;
         read_index += 1;
-        println!("pps num = {}", num_of_pps);
+        // println!("pps num = {}", num_of_pps);
         for _ in 0..num_of_pps as usize {
             let data_len = BigEndian::read_u16(&bytes[read_index..]);
             read_index += 2;
             let data = &bytes[read_index..(read_index + data_len as usize)];
             read_index += data_len as usize;
-            println!("len={}, pps data:\n{}", data_len, bytes_hex_format(data));
+            // println!("len={}, pps data:\n{}", data_len, bytes_hex_format(data));
 
             let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
             nalu_bytes.extend_from_slice(data);
@@ -558,7 +574,7 @@ pub fn handle_video_data(bytes: &[u8]) {
             read_index += 4;
             let data = &bytes[read_index..(read_index + data_len as usize)];
             read_index += data_len as usize;
-            println!("NALU Type: {}, len={}", nalu_type_desc(&data[0]), data_len);
+            // println!("NALU Type: {}, len={}", nalu_type_desc(&data[0]), data_len);
             // println!("len={}, nalu data:\n{}", data_len, bytes_hex_format(data));
 
             let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x01];
@@ -571,10 +587,7 @@ pub fn handle_video_data(bytes: &[u8]) {
 }
 
 fn handle_nalu(nalu_bytes: Vec<u8>) {
-    smol::block_on(global_eventbus().publish(nalu_bytes));
-    // if let Err(e) = smol::block_on(ctx.write_file(nalu_bytes)) {
-    //     log::error!("write_file error, {:?}", e);
-    // }
+    smol::block_on(nalu_eventbus().publish(nalu_bytes));
 }
 
 fn nalu_type_desc(nalu_type: &u8) -> String {
