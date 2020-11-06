@@ -108,6 +108,7 @@ pub struct RtmpContext {
     pub recv_bytes_num: u32,
     pub arc_receiver: Arc<Receiver<Vec<u8>>>,
     pub peer_addr: String,
+    pub stream_name: String,
 }
 
 impl RtmpContext {
@@ -158,6 +159,7 @@ impl RtmpContext {
             recv_bytes_num: 0,
             arc_receiver: receiver,
             peer_addr,
+            stream_name: Default::default(),
         }
     }
 
@@ -190,11 +192,20 @@ pub struct RtmpMessageHeader {
 
 impl RtmpMessageHeader {
     pub fn to_bytes(&self) -> Vec<u8> {
+        let enable_extend_timestamp_field = self.timestamp >= 0xFFFFFF;
+
         let mut rs = vec![self.csid];
-        rs.write_u24::<BigEndian>(self.timestamp).unwrap();
+        if enable_extend_timestamp_field {
+            rs.write_u24::<BigEndian>(0xFFFFFF).unwrap();
+        } else {
+            rs.write_u24::<BigEndian>(self.timestamp).unwrap();
+        }
         rs.write_u24::<BigEndian>(self.message_length).unwrap();
         rs.write_u8(self.message_type_id).unwrap();
         rs.write_u32::<BigEndian>(self.msid).unwrap();
+        if enable_extend_timestamp_field {
+            rs.write_u32::<BigEndian>(self.timestamp).unwrap();
+        }
         rs
     }
 }
@@ -231,11 +242,17 @@ impl RtmpMessage {
                 // 时间差值置零
                 ctx.last_timestamp_delta = 0;
                 ctx.last_timestamp = BigEndian::read_u24(&h[0..3]);
+
                 ctx.last_message_length = BigEndian::read_u24(&h[3..6]);
                 ctx.remain_message_length = 0;
                 ctx.last_message_type_id = h[6];
                 ctx.last_message_stream_id = BigEndian::read_u32(&h[7..11]);
                 ctx.recv_bytes_num += 12;
+                if ctx.last_timestamp >= 0xFFFFFF {
+                    let extend = ctx.read_exact_from_peer(4).await?;
+                    ctx.last_timestamp = BigEndian::read_u32(&extend[0..4]);
+                    ctx.recv_bytes_num += 4;
+                }
 
                 (ctx.last_timestamp,
                  ctx.last_message_length,
@@ -510,6 +527,7 @@ pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
 ///     0
 /// See ISO 14496-12, 8.15.3 for an explanation of composition
 /// times. The offset in an FLV file is always in milliseconds.
+#[allow(unused)]
 pub fn handle_video_data(bytes: &[u8], ctx: &RtmpContext) {
     let frame_type = bytes[0];
     let mut read_index = 1;
@@ -584,38 +602,13 @@ pub fn handle_video_data(bytes: &[u8], ctx: &RtmpContext) {
     } else {
         unreachable!("unknown acv packet type")
     };
+
+    fn handle_nalu(nalu_bytes: Vec<u8>) {
+        smol::block_on(nalu_eventbus().publish(nalu_bytes));
+    }
 }
 
-fn handle_nalu(nalu_bytes: Vec<u8>) {
-    smol::block_on(nalu_eventbus().publish(nalu_bytes));
-}
 
-fn nalu_type_desc(nalu_type: &u8) -> String {
-    let priority: String = match (nalu_type & 0x60) >> 5 {
-        0 => "DISPOSABLE".into(),
-        1 => "LOW".into(),
-        2 => "HIGH".into(),
-        3 => "HIGHEST".into(),
-        _ => "UNKNOWN".into(),
-    };
 
-    let t: String = match nalu_type & 0x1F {
-        1 => "SLICE".into(),
-        2 => "DPA".into(),
-        3 => "DPB".into(),
-        4 => "DPC".into(),
-        5 => "IDR".into(),
-        6 => "SEI".into(),
-        7 => "SPS".into(),
-        8 => "PPS".into(),
-        9 => "AUD".into(),
-        10 => "EOSEQ".into(),
-        11 => "EOSTREAM".into(),
-        12 => "FILL".into(),
-        _ => "UNKNOWN".into(),
-    };
-
-    format!("{}::{}", priority, t)
-}
 
 

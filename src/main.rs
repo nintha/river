@@ -13,6 +13,7 @@ use protocol::rtmp::*;
 use crate::util::{bytes_hex_format, print_hex, spawn_and_log_error, gen_random_bytes};
 use crate::eventbus::EventBus;
 use once_cell::sync::OnceCell;
+use dashmap::DashMap;
 
 mod util;
 mod protocol;
@@ -26,6 +27,11 @@ fn nalu_eventbus() -> &'static EventBus<Vec<u8>> {
 fn rtmp_msg_eventbus() -> &'static EventBus<RtmpMessage> {
     static INSTANCE: OnceCell<EventBus<RtmpMessage>> = OnceCell::new();
     INSTANCE.get_or_init(|| EventBus::with_label("RTMP_MSG"))
+}
+
+fn sps_message_map() -> &'static DashMap<String, RtmpMessage> {
+    static INSTANCE: OnceCell<DashMap<String, RtmpMessage>> = OnceCell::new();
+    INSTANCE.get_or_init(|| DashMap::new())
 }
 
 /// TCP 连接处理
@@ -65,6 +71,7 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     let buffer_length = BigEndian::read_u32(&bytes[6..10]);
                     log::info!("[peer={}] C->S, [{}] set buffer length={}, streamId={}", ctx.peer_addr, message.message_type_desc(), buffer_length, stream_id);
                     response_play(&mut ctx, stream_id).await?;
+                    // TODO 使用动态的值
                     send_meta_data_for_play(&mut ctx, &RtmpMetaData {
                         width: 1280.0,
                         height: 720.0,
@@ -75,24 +82,20 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                         frame_rate: 30.0,
                         duration: 30.0,
                     }).await?;
-                    // TODO send video stream to peer
-                    fn is_key_frame(msg: &RtmpMessage) -> bool {
-                        if let ChunkMessageType::VideoMessage = msg.header.message_type {
-                            msg.body[0] >> 4 == 1
-                        } else {
-                            false
+
+                    ctx.ctx_begin_timestamp = Local::now().timestamp_millis();
+
+                    // 发送sps/pps帧
+                    if let Some(msg) = sps_message_map().get(&ctx.stream_name) {
+                        let chunks = msg.split_chunks_bytes(ctx.chunk_size);
+                        for chunk in chunks {
+                            ctx.write_to_peer(&chunk).await?;
                         }
                     }
 
-                    let mut wait_key_frame = true;
                     let receiver = rtmp_msg_eventbus().register_receiver();
                     while let Ok(mut msg) = receiver.recv().await {
-                        if wait_key_frame && !is_key_frame(&msg) {
-                            continue;
-                        }
-                        wait_key_frame = false;
-
-                        msg.header.msid = 1;
+                        // log::info!("[peer={}] frame type = {:#04X}, acv_packet_type={:#04X}", &ctx.peer_addr, msg.body[0], msg.body[1]);
                         msg.header.timestamp = (Local::now().timestamp_millis() - ctx.ctx_begin_timestamp) as u32;
                         let chunks = msg.split_chunks_bytes(ctx.chunk_size);
                         for chunk in chunks {
@@ -123,7 +126,13 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                         response_create_stream(&mut ctx, &values[1]).await?;
                     }
                     "publish" => {
+                        ctx.stream_name = values[3].try_as_str().unwrap_or_default().to_string();
+                        log::info!("[peer={}] stream_name={}", ctx.peer_addr, ctx.stream_name);
                         response_publish(&mut ctx).await?;
+                    }
+                    "play" => {
+                        ctx.stream_name = values[3].try_as_str().unwrap_or_default().to_string();
+                        log::info!("[peer={}] stream_name={}", ctx.peer_addr, ctx.stream_name);
                     }
                     _ => ()
                 }
@@ -145,8 +154,13 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
 
             ChunkMessageType::VideoMessage => {
                 log::debug!("[peer={}] C->S, [{}] header={:?}", ctx.peer_addr, message.message_type_desc(), message.header);
-                rtmp_msg_eventbus().publish(message.clone()).await;
-                handle_video_data(&message.body, &ctx);
+                if message.body[0] == 0x17 && message.body[1] == 0x00 {
+                    sps_message_map().insert(ctx.stream_name.clone(), message.clone());
+                    log::info!("[peer={}] C->S, cache sps/pps message, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                } else {
+                    rtmp_msg_eventbus().publish(message.clone()).await;
+                }
+                // handle_video_data(&message.body, &ctx);
             }
             ChunkMessageType::AudioMessage => {
                 // sender.send(message).await?;
@@ -156,25 +170,6 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
             }
         }
     }
-
-// log::info!("C->S, others:");
-// let mut i = 0;
-// let mut arr: [char; 8] = ['.'; 8];
-// loop {
-//     let byte = stream.read_one_return().await?;
-//     print!("{:#04X}", byte);
-//     if byte.is_ascii_graphic() {
-//         arr[i % 8] = byte as char;
-//     } else {
-//         arr[i % 8] = '.';
-//     }
-//     print!(" ");
-//     std::io::stdout().flush()?;
-//     i += 1;
-//     if i % 8 == 0 {
-//         println!("  {}", arr.iter().collect::<String>());
-//     }
-// }
 }
 
 /// 处理RTMP握手流程
@@ -356,7 +351,7 @@ async fn response_publish(ctx: &mut RtmpContext) -> anyhow::Result<()> {
 
 async fn response_play(ctx: &mut RtmpContext, stream_id: u32) -> anyhow::Result<()> {
     {
-        let mut rs: Vec<u8> = vec![
+        let rs: Vec<u8> = vec![
             0x02, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x02, 0x04,
             0x00, 0x00, 0x00, 0x01,
@@ -503,6 +498,6 @@ async fn send_meta_data_for_play(ctx: &mut RtmpContext, meta_data: &RtmpMetaData
 
 fn main() -> anyhow::Result<()> {
     util::init_logger();
-    let server = "127.0.0.1:1935";
+    let server = "127.0.0.1:11935";
     smol::block_on(accept_loop(server))
 }
