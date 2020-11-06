@@ -87,6 +87,8 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
 
                     // 发送sps/pps帧
                     if let Some(msg) = sps_message_map().get(&ctx.stream_name) {
+                        let mut msg = msg.value().clone();
+                        msg.header.timestamp = 0;
                         let chunks = msg.split_chunks_bytes(ctx.chunk_size);
                         for chunk in chunks {
                             ctx.write_to_peer(&chunk).await?;
@@ -157,9 +159,9 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                 if message.body[0] == 0x17 && message.body[1] == 0x00 {
                     sps_message_map().insert(ctx.stream_name.clone(), message.clone());
                     log::info!("[peer={}] C->S, cache sps/pps message, stream_name={}", ctx.peer_addr, ctx.stream_name);
-                } else {
-                    rtmp_msg_eventbus().publish(message.clone()).await;
                 }
+                rtmp_msg_eventbus().publish(message.clone()).await;
+
                 // handle_video_data(&message.body, &ctx);
             }
             ChunkMessageType::AudioMessage => {
