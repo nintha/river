@@ -1,4 +1,22 @@
 # River
 RTMP Live Stream Server
 
-目标: 完成demo，支持一个推流请求和一个拉流请求，不考虑并发
+
+
+## Push
+
+OBS
+
+## Play
+
+```shell
+ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/token
+```
+
+使用`-fflags nobuffer -analyzeduration 100000`可以有效降低播放的延迟，目前本地测试延迟大概为1秒
+
+
+
+## TODO
+
+- [ ] 支持不同分辨率的推流和拉流（目前固定1028x720）
