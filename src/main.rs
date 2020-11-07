@@ -34,6 +34,11 @@ fn sps_message_map() -> &'static DashMap<String, RtmpMessage> {
     INSTANCE.get_or_init(|| DashMap::new())
 }
 
+fn meta_data_map() -> &'static DashMap<String, RtmpMetaData> {
+    static INSTANCE: OnceCell<DashMap<String, RtmpMetaData>> = OnceCell::new();
+    INSTANCE.get_or_init(|| DashMap::new())
+}
+
 /// TCP 连接处理
 async fn accept_loop(addr: &str) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr.clone()).await?;
@@ -71,17 +76,13 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     let buffer_length = BigEndian::read_u32(&bytes[6..10]);
                     log::info!("[peer={}] C->S, [{}] set buffer length={}, streamId={}", ctx.peer_addr, message.message_type_desc(), buffer_length, stream_id);
                     response_play(&mut ctx, stream_id).await?;
-                    // TODO 使用动态的值
-                    send_meta_data_for_play(&mut ctx, &RtmpMetaData {
-                        width: 1280.0,
-                        height: 720.0,
-                        video_codec_id: "avc1".to_string(),
-                        video_data_rate: 2000.0,
-                        audio_codec_id: "mp4a".to_string(),
-                        audio_data_rate: 160.0,
-                        frame_rate: 30.0,
-                        duration: 30.0,
-                    }).await?;
+
+                    if let Some(el) = meta_data_map().get(&ctx.stream_name) {
+                        send_meta_data_for_play(&mut ctx, el.value()).await?;
+                    } else {
+                        log::warn!("[peer={}] not found meta_data, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                        continue;
+                    };
 
                     ctx.ctx_begin_timestamp = Local::now().timestamp_millis();
 
@@ -152,6 +153,43 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                         log::info!("[peer={}] C->S, [{}] part: {:?}", ctx.peer_addr, command, v);
                     }
                 }
+                if command == "@setDataFrame" {
+                    let mut meta_data = RtmpMetaData::default();
+                    if let Value::EcmaArray {entries}  = &values[2] {
+                        for item in entries {
+                            match item.key.as_ref() {
+                                "duration" => {
+                                    meta_data.duration = item.value.try_as_f64().unwrap_or_default();
+                                }
+                                "width" => {
+                                    meta_data.width = item.value.try_as_f64().unwrap_or_default();
+                                }
+                                "height" => {
+                                    meta_data.height = item.value.try_as_f64().unwrap_or_default();
+                                }
+                                "videocodecid" => {
+                                    meta_data.video_codec_id = item.value.try_as_str().unwrap_or_default().to_owned();
+                                }
+                                "videodatarate" => {
+                                    meta_data.video_data_rate = item.value.try_as_f64().unwrap_or_default();
+                                }
+                                "framerate" => {
+                                    meta_data.frame_rate = item.value.try_as_f64().unwrap_or_default();
+                                }
+                                "audiocodecid" => {
+                                    meta_data.audio_codec_id = item.value.try_as_str().unwrap_or_default().to_owned();
+                                }
+                                "audiodatarate" => {
+                                    meta_data.audio_data_rate = item.value.try_as_f64().unwrap_or_default();
+                                }
+                                _=>{}
+                            }
+                        }
+                    }
+                    meta_data_map().insert(ctx.stream_name.clone(), meta_data);
+                    log::info!("[peer={}] C->S, cache meta_data, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                }
+
             }
 
             ChunkMessageType::VideoMessage => {

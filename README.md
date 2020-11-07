@@ -19,4 +19,5 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 
 ## TODO
 
-- [ ] 支持不同分辨率的推流和拉流（目前固定1028x720）
+- [x] 支持不同分辨率的推流和拉流（之前默认1028x720）
+- [ ] 支持音频传输
