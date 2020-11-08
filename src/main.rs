@@ -19,6 +19,12 @@ mod util;
 mod protocol;
 mod eventbus;
 
+fn main() -> anyhow::Result<()> {
+    util::init_logger();
+    let server = "0.0.0.0:11935";
+    smol::block_on(accept_loop(server))
+}
+
 fn nalu_eventbus() -> &'static EventBus<Vec<u8>> {
     static INSTANCE: OnceCell<EventBus<Vec<u8>>> = OnceCell::new();
     INSTANCE.get_or_init(|| EventBus::with_label("NALU"))
@@ -29,7 +35,12 @@ fn rtmp_msg_eventbus() -> &'static EventBus<RtmpMessage> {
     INSTANCE.get_or_init(|| EventBus::with_label("RTMP_MSG"))
 }
 
-fn sps_message_map() -> &'static DashMap<String, RtmpMessage> {
+fn video_header_map() -> &'static DashMap<String, RtmpMessage> {
+    static INSTANCE: OnceCell<DashMap<String, RtmpMessage>> = OnceCell::new();
+    INSTANCE.get_or_init(|| DashMap::new())
+}
+
+fn audio_header_map() -> &'static DashMap<String, RtmpMessage> {
     static INSTANCE: OnceCell<DashMap<String, RtmpMessage>> = OnceCell::new();
     INSTANCE.get_or_init(|| DashMap::new())
 }
@@ -87,18 +98,27 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     ctx.ctx_begin_timestamp = Local::now().timestamp_millis();
 
                     // 发送sps/pps帧
-                    if let Some(msg) = sps_message_map().get(&ctx.stream_name) {
-                        let mut msg = msg.value().clone();
-                        msg.header.timestamp = 0;
+                    if let Some(msg) = video_header_map().get(&ctx.stream_name) {
                         let chunks = msg.split_chunks_bytes(ctx.chunk_size);
                         for chunk in chunks {
                             ctx.write_to_peer(&chunk).await?;
                         }
-                    }
+                    } else {
+                        log::warn!("[peer={}] not found video header, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                    };
+
+                    // 发送 aac header
+                    if let Some(msg) = audio_header_map().get(&ctx.stream_name) {
+                        let chunks = msg.split_chunks_bytes(ctx.chunk_size);
+                        for chunk in chunks {
+                            ctx.write_to_peer(&chunk).await?;
+                        }
+                    } else {
+                        log::warn!("[peer={}] not found audio header, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                    };
 
                     let receiver = rtmp_msg_eventbus().register_receiver();
                     while let Ok(mut msg) = receiver.recv().await {
-                        // log::info!("[peer={}] frame type = {:#04X}, acv_packet_type={:#04X}", &ctx.peer_addr, msg.body[0], msg.body[1]);
                         msg.header.timestamp = (Local::now().timestamp_millis() - ctx.ctx_begin_timestamp) as u32;
                         let chunks = msg.split_chunks_bytes(ctx.chunk_size);
                         for chunk in chunks {
@@ -112,8 +132,8 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
             ChunkMessageType::AMF0CommandMessage => {
                 let option = message.try_read_body_to_amf0();
                 if option.is_none() {
-                    log::error!("[peer={}] C->S, ctx={:#?} \n msg={:#?}", ctx.peer_addr, &ctx, &message);
-                    unreachable!();
+                    log::error!("[peer={}] C->S, expect AMF0 data, ctx={:#?} \n msg={:#?}", ctx.peer_addr, &ctx, &message);
+                    Err(anyhow::anyhow!("[AMF0CommandMessage] expect AMF0 data"))?
                 }
                 let values = option.unwrap();
                 let command = values[0].try_as_str().unwrap();
@@ -155,7 +175,7 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                 }
                 if command == "@setDataFrame" {
                     let mut meta_data = RtmpMetaData::default();
-                    if let Value::EcmaArray {entries}  = &values[2] {
+                    if let Value::EcmaArray { entries } = &values[2] {
                         for item in entries {
                             match item.key.as_ref() {
                                 "duration" => {
@@ -182,28 +202,33 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                                 "audiodatarate" => {
                                     meta_data.audio_data_rate = item.value.try_as_f64().unwrap_or_default();
                                 }
-                                _=>{}
+                                _ => {}
                             }
                         }
                     }
                     meta_data_map().insert(ctx.stream_name.clone(), meta_data);
                     log::info!("[peer={}] C->S, cache meta_data, stream_name={}", ctx.peer_addr, ctx.stream_name);
                 }
-
             }
 
             ChunkMessageType::VideoMessage => {
                 log::debug!("[peer={}] C->S, [{}] header={:?}", ctx.peer_addr, message.message_type_desc(), message.header);
                 if message.body[0] == 0x17 && message.body[1] == 0x00 {
-                    sps_message_map().insert(ctx.stream_name.clone(), message.clone());
-                    log::info!("[peer={}] C->S, cache sps/pps message, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                    let mut message_clone = message.clone();
+                    message_clone.header.timestamp = 0;
+                    video_header_map().insert(ctx.stream_name.clone(), message_clone);
+                    log::info!("[peer={}] C->S, cache video header, stream_name={}", ctx.peer_addr, ctx.stream_name);
                 }
                 rtmp_msg_eventbus().publish(message.clone()).await;
-
-                // handle_video_data(&message.body, &ctx);
             }
             ChunkMessageType::AudioMessage => {
-                // sender.send(message).await?;
+                if message.body[0] == 0xAF && message.body[1] == 0x00 {
+                    let mut message_clone = message.clone();
+                    message_clone.header.timestamp = 0;
+                    audio_header_map().insert(ctx.stream_name.clone(), message_clone);
+                    log::info!("[peer={}] C->S, cache audio header, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                }
+                rtmp_msg_eventbus().publish(message.clone()).await;
             }
             _ => {
                 log::info!("[peer={}] C->S, [{}] OTHER len={}", ctx.peer_addr, message.message_type_desc(), message.header.message_length);
@@ -536,8 +561,3 @@ async fn send_meta_data_for_play(ctx: &mut RtmpContext, meta_data: &RtmpMetaData
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    util::init_logger();
-    let server = "127.0.0.1:11935";
-    smol::block_on(accept_loop(server))
-}
