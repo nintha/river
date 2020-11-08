@@ -1,19 +1,21 @@
 use std::fmt::{Debug, Formatter};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use amf::amf0;
 use amf::amf0::Value;
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use chrono::Local;
 use num::FromPrimitive;
+use smol::channel::Receiver;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::TcpStream;
-
-use crate::util::{bytes_hex_format, spawn_and_log_error};
-use smol::channel::{Receiver};
-use crate::nalu_eventbus;
-use std::sync::{Arc, Weak};
 use smol_timeout::TimeoutExt;
-use std::time::Duration;
+
+use crate::{nalu_eventbus, rtmp_msg_eventbus};
+use crate::protocol::flv::FlvTag;
+use crate::util::{bytes_hex_format, spawn_and_log_error};
+use crate::protocol::flv;
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -106,16 +108,22 @@ pub struct RtmpContext {
     pub chunk_size: u32,
     pub remain_message_length: u32,
     pub recv_bytes_num: u32,
-    pub arc_receiver: Arc<Receiver<Vec<u8>>>,
+    pub nalu_rx: Arc<Receiver<Vec<u8>>>,
     pub peer_addr: String,
     pub stream_name: String,
+    pub flv_rx: Arc<Receiver<RtmpMessage>>
 }
 
 impl RtmpContext {
     pub fn new(stream: TcpStream) -> Self {
-        let receiver = nalu_eventbus().register_receiver();
-        let receiver = Arc::new(receiver);
-        let nalu_rx_weak = Arc::downgrade(&receiver);
+        let nalu_rx = nalu_eventbus().register_receiver();
+        let nalu_rx = Arc::new(nalu_rx);
+        let nalu_rx_weak = Arc::downgrade(&nalu_rx);
+
+        let flv_rx = rtmp_msg_eventbus().register_receiver();
+        let flv_rx = Arc::new(flv_rx);
+        let flv_rx_weak = Arc::downgrade(&flv_rx);
+
         let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
 
         async fn handle_nalu_rx(nalu_rx: Weak<Receiver<Vec<u8>>>, peer_addr: String) -> anyhow::Result<()> {
@@ -144,7 +152,39 @@ impl RtmpContext {
             Ok(())
         }
 
+        async fn handle_flv_rx(flv_rx: Weak<Receiver<RtmpMessage>>, peer_addr: String) -> anyhow::Result<()> {
+            let tmp_dir = "tmp";
+            if smol::fs::read_dir(tmp_dir).await.is_err() {
+                smol::fs::create_dir_all(tmp_dir).await?;
+            }
+
+            let mut file = smol::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open("tmp/output.flv")
+                .await?;
+
+            // write header
+            file.write_all(&flv::FLV_HEADER_WITH_TAG0).await?;
+
+            while let Some(rx) = flv_rx.upgrade() {
+                if let Some(rs) = rx.recv().timeout(Duration::from_secs(1)).await {
+                    if let Ok(msg) = rs {
+                        let flv_tag = FlvTag::from_rtmp_message(msg)?;
+                        file.write_all(flv_tag.as_ref()).await?;
+                        file.write_all(&(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            log::warn!("[peer={}][handle_flv_rx] closed", peer_addr);
+            Ok(())
+        }
+
         spawn_and_log_error(handle_nalu_rx(nalu_rx_weak, peer_addr.clone()));
+        spawn_and_log_error(handle_flv_rx(flv_rx_weak, peer_addr.clone()));
 
         RtmpContext {
             stream,
@@ -157,7 +197,8 @@ impl RtmpContext {
             chunk_size: 128,
             remain_message_length: 0,
             recv_bytes_num: 0,
-            arc_receiver: receiver,
+            nalu_rx,
+            flv_rx,
             peer_addr,
             stream_name: Default::default(),
         }
@@ -178,7 +219,6 @@ impl RtmpContext {
 #[derive(Debug, Clone)]
 pub struct RtmpMessageHeader {
     /// chunk stream id
-    /// 2 (low level), 3 (high level), 4 (control stream), 5 (video) and 6 (audio).
     pub csid: u8,
     pub timestamp: u32,
     pub message_length: u32,
