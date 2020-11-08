@@ -3,13 +3,13 @@ use dashmap::DashMap;
 use crossbeam_utils::atomic::AtomicCell;
 
 pub struct EventBus<E> {
-    label: &'static str,
+    label: String,
     incr_val: AtomicCell<u64>,
     tx_map: DashMap<u64, Sender<E>>,
 }
 
 impl<E: 'static + Clone> EventBus<E> {
-    pub fn with_label(label: &'static str) -> Self {
+    pub fn with_label(label: String) -> Self {
         Self {
             label,
             incr_val: Default::default(),

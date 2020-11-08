@@ -25,14 +25,9 @@ fn main() -> anyhow::Result<()> {
     smol::block_on(accept_loop(server))
 }
 
-fn nalu_eventbus() -> &'static EventBus<Vec<u8>> {
-    static INSTANCE: OnceCell<EventBus<Vec<u8>>> = OnceCell::new();
-    INSTANCE.get_or_init(|| EventBus::with_label("NALU"))
-}
-
-fn rtmp_msg_eventbus() -> &'static EventBus<RtmpMessage> {
-    static INSTANCE: OnceCell<EventBus<RtmpMessage>> = OnceCell::new();
-    INSTANCE.get_or_init(|| EventBus::with_label("RTMP_MSG"))
+fn eventbus_map() -> &'static DashMap<String, EventBus<RtmpMessage>> {
+    static INSTANCE: OnceCell<DashMap<String, EventBus<RtmpMessage>>> = OnceCell::new();
+    INSTANCE.get_or_init(|| DashMap::new())
 }
 
 fn video_header_map() -> &'static DashMap<String, RtmpMessage> {
@@ -117,13 +112,18 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                         log::warn!("[peer={}] not found audio header, stream_name={}", ctx.peer_addr, ctx.stream_name);
                     };
 
-                    let receiver = rtmp_msg_eventbus().register_receiver();
-                    while let Ok(mut msg) = receiver.recv().await {
-                        msg.header.timestamp = (Local::now().timestamp_millis() - ctx.ctx_begin_timestamp) as u32;
-                        let chunks = msg.split_chunks_bytes(ctx.chunk_size);
-                        for chunk in chunks {
-                            ctx.write_to_peer(&chunk).await?;
+                    if let Some(eventbus) = eventbus_map().get(&ctx.stream_name) {
+                        let receiver = eventbus.register_receiver();
+                        while let Ok(mut msg) = receiver.recv().await {
+                            msg.header.timestamp = (Local::now().timestamp_millis() - ctx.ctx_begin_timestamp) as u32;
+                            let chunks = msg.split_chunks_bytes(ctx.chunk_size);
+                            for chunk in chunks {
+                                ctx.write_to_peer(&chunk).await?;
+                            }
                         }
+                    } else {
+                        log::error!("[peer={}] not found eventbus, stream_name={}", ctx.peer_addr, ctx.stream_name);
+                        Err(anyhow::anyhow!("not found stream {}", ctx.stream_name))?;
                     }
                 } else {
                     log::info!("[peer={}] C->S, [{}] \n{}", ctx.peer_addr, message.message_type_desc(), bytes_hex_format(&message.body));
@@ -151,6 +151,11 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     "publish" => {
                         ctx.stream_name = values[3].try_as_str().unwrap_or_default().to_string();
                         log::info!("[peer={}] stream_name={}", ctx.peer_addr, ctx.stream_name);
+
+                        // 推送者创建eventbus
+                        eventbus_map().insert(ctx.stream_name.clone(), EventBus::with_label(ctx.stream_name.clone()));
+                        ctx.is_publisher = true;
+                        ctx.save_flv_background();
                         response_publish(&mut ctx).await?;
                     }
                     "play" => {
@@ -219,7 +224,9 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     video_header_map().insert(ctx.stream_name.clone(), message_clone);
                     log::info!("[peer={}] C->S, cache video header, stream_name={}", ctx.peer_addr, ctx.stream_name);
                 }
-                rtmp_msg_eventbus().publish(message.clone()).await;
+                if let Some(eventbus) = eventbus_map().get(&ctx.stream_name) {
+                    eventbus.publish(message.clone()).await;
+                }
             }
             ChunkMessageType::AudioMessage => {
                 if message.body[0] == 0xAF && message.body[1] == 0x00 {
@@ -228,7 +235,9 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     audio_header_map().insert(ctx.stream_name.clone(), message_clone);
                     log::info!("[peer={}] C->S, cache audio header, stream_name={}", ctx.peer_addr, ctx.stream_name);
                 }
-                rtmp_msg_eventbus().publish(message.clone()).await;
+                if let Some(eventbus) = eventbus_map().get(&ctx.stream_name) {
+                    eventbus.publish(message.clone()).await;
+                }
             }
             _ => {
                 log::info!("[peer={}] C->S, [{}] OTHER len={}", ctx.peer_addr, message.message_type_desc(), message.header.message_length);

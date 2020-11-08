@@ -2,6 +2,7 @@ use chrono::Local;
 use std::io::Write;
 use std::future::Future;
 use rand::Rng;
+use std::fmt::Debug;
 
 pub fn init_logger() {
     let env = env_logger::Env::default()
@@ -76,7 +77,11 @@ pub fn print_hex(bytes: &[u8]) {
 }
 
 /// 执行一个新协程，并且在错误时打印错误信息
-pub fn spawn_and_log_error<F>(fut: F) where F: Future<Output=anyhow::Result<()>> + Send + 'static {
+pub fn spawn_and_log_error<F, E>(fut: F)
+    where
+        F: Future<Output=Result<(), E>> + Send + 'static,
+        E: Debug,
+{
     smol::spawn(async move {
         if let Err(e) = fut.await {
             log::error!("spawn future error, {:?}", e)
