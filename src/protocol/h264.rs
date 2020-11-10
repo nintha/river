@@ -49,4 +49,3 @@ impl Nalu {
         format!("{}::{}", priority, t)
     }
 }
-

@@ -1,19 +1,15 @@
 use std::fmt::{Debug, Formatter};
-use std::time::{Duration, Instant};
 
 use amf::amf0;
 use amf::amf0::Value;
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use chrono::Local;
 use num::FromPrimitive;
-use smol::channel::Receiver;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::TcpStream;
 
-use crate::{eventbus_map};
-use crate::protocol::flv;
-use crate::protocol::flv::FlvTag;
-use crate::util::{bytes_hex_format, spawn_and_log_error};
+use crate::rtmp_server::eventbus_map;
+use crate::util::bytes_hex_format;
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -27,7 +23,7 @@ pub struct Handshake0 {
     /// with a printable character). A server that does not recognize the
     /// client’s requested version SHOULD respond with 3. The client MAY
     /// choose to degrade to version 3, or to abandon the handshake.
-    pub version: u8
+    pub version: u8,
 }
 
 impl Handshake0 {
@@ -113,7 +109,10 @@ pub struct RtmpContext {
 
 impl RtmpContext {
     pub fn new(stream: TcpStream) -> Self {
-        let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+        let peer_addr = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         RtmpContext {
             stream,
             ctx_begin_timestamp: Local::now().timestamp_millis(),
@@ -129,49 +128,6 @@ impl RtmpContext {
             stream_name: Default::default(),
             is_publisher: false,
         }
-    }
-
-    /// 后台保存FLV文件
-    pub fn save_flv_background(&mut self) {
-        if let Some(eventbus) = eventbus_map().get(&self.stream_name) {
-            let flv_rx = eventbus.register_receiver();
-            spawn_and_log_error(RtmpContext::handle_flv_rx(flv_rx, self.peer_addr.clone()));
-        }
-    }
-
-    /// Rtmp流输出到FLV文件
-    async fn handle_flv_rx(flv_rx: Receiver<RtmpMessage>, peer_addr: String) -> anyhow::Result<()> {
-        let tmp_dir = "tmp";
-        if smol::fs::read_dir(tmp_dir).await.is_err() {
-            smol::fs::create_dir_all(tmp_dir).await?;
-        }
-
-        let mut file = smol::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open("tmp/output.flv")
-            .await?;
-
-        // write header
-        file.write_all(&flv::FLV_HEADER_WITH_TAG0).await?;
-
-        let ctx_begin_timestamp = Local::now().timestamp_millis();
-        let mut last_flush_time = Instant::now();
-        let min_flush_duration = Duration::from_secs(2);
-        while let Ok(mut msg) = flv_rx.recv().await {
-            msg.header.timestamp = (Local::now().timestamp_millis() - ctx_begin_timestamp) as u32;
-            let flv_tag = FlvTag::from_rtmp_message(msg)?;
-            file.write_all(flv_tag.as_ref()).await?;
-            file.write_all(&(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
-
-            if last_flush_time.elapsed() > min_flush_duration {
-                last_flush_time = Instant::now();
-                file.flush().await?
-            }
-        }
-        log::warn!("[peer={}][handle_flv_rx] closed", peer_addr);
-        Ok(())
     }
 
     pub async fn read_exact_from_peer(&mut self, bytes_num: u32) -> anyhow::Result<Vec<u8>> {
@@ -190,7 +146,11 @@ impl Drop for RtmpContext {
     fn drop(&mut self) {
         if self.is_publisher {
             eventbus_map().remove(&self.stream_name);
-            log::warn!("[{}][RtmpContext] remove eventbus, stream_name={}", self.peer_addr, self.stream_name);
+            log::warn!(
+                "[{}][RtmpContext] remove eventbus, stream_name={}",
+                self.peer_addr,
+                self.stream_name
+            );
         }
     }
 }
@@ -273,10 +233,12 @@ impl RtmpMessage {
                     ctx.recv_bytes_num += 4;
                 }
 
-                (ctx.last_timestamp,
-                 ctx.last_message_length,
-                 ctx.last_message_type_id,
-                 ctx.last_message_stream_id)
+                (
+                    ctx.last_timestamp,
+                    ctx.last_message_length,
+                    ctx.last_message_type_id,
+                    ctx.last_message_stream_id,
+                )
             }
             1 => {
                 let h = ctx.read_exact_from_peer(7).await?;
@@ -288,10 +250,12 @@ impl RtmpMessage {
                 ctx.last_timestamp += timestamp_delta;
                 ctx.recv_bytes_num += 8;
 
-                (ctx.last_timestamp,
-                 ctx.last_message_length,
-                 ctx.last_message_type_id,
-                 ctx.last_message_stream_id)
+                (
+                    ctx.last_timestamp,
+                    ctx.last_message_length,
+                    ctx.last_message_type_id,
+                    ctx.last_message_stream_id,
+                )
             }
             2 => {
                 let h = ctx.read_exact_from_peer(3).await?;
@@ -300,19 +264,23 @@ impl RtmpMessage {
                 ctx.last_timestamp += timestamp_delta;
                 ctx.recv_bytes_num += 4;
 
-                (ctx.last_timestamp,
-                 ctx.last_message_length,
-                 ctx.last_message_type_id,
-                 ctx.last_message_stream_id)
+                (
+                    ctx.last_timestamp,
+                    ctx.last_message_length,
+                    ctx.last_message_type_id,
+                    ctx.last_message_stream_id,
+                )
             }
             3 => {
                 ctx.last_timestamp += ctx.last_timestamp_delta;
-                (ctx.last_timestamp,
-                 ctx.last_message_length,
-                 ctx.last_message_type_id,
-                 ctx.last_message_stream_id)
+                (
+                    ctx.last_timestamp,
+                    ctx.last_message_length,
+                    ctx.last_message_type_id,
+                    ctx.last_message_stream_id,
+                )
             }
-            _ => unreachable!()
+            _ => unreachable!(),
         };
 
         // 当前分片的body长度
@@ -334,8 +302,9 @@ impl RtmpMessage {
         let message_data = ctx.read_exact_from_peer(read_num).await?;
         ctx.recv_bytes_num += read_num;
 
-        let message_type = FromPrimitive::from_u8(message_type_id)
-            .ok_or(anyhow::anyhow!(format!("invalid message type: {}", message_type_id)))?;
+        let message_type = FromPrimitive::from_u8(message_type_id).ok_or(anyhow::anyhow!(
+            format!("invalid message type: {}", message_type_id)
+        ))?;
         Ok(RtmpMessage {
             header: RtmpMessageHeader {
                 csid,
@@ -368,14 +337,15 @@ impl RtmpMessage {
             9 => "CommandMessages::VideoMessage",
             22 => "CommandMessages::AggregateMessage",
             _ => "UnknownMessage",
-        }.to_string()
+        }
+        .to_string()
     }
 
     /// 把body数据解析成amf0格式
     pub fn try_read_body_to_amf0(&self) -> Option<Vec<Value>> {
         match self.header.message_type_id {
             18 | 19 | 20 => read_all_amf_value(&self.body),
-            _ => None
+            _ => None,
         }
     }
 
@@ -411,11 +381,14 @@ impl RtmpMessage {
 
 impl Debug for RtmpMessage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ChunkMessage {{\nheader: {:?}\nmessage type: {}\nchunk count={}\nbody:\n{}}}",
-               self.header,
-               self.message_type_desc(),
-               self.chunk_count,
-               bytes_hex_format(&self.body))
+        write!(
+            f,
+            "ChunkMessage {{\nheader: {:?}\nmessage type: {}\nchunk count={}\nbody:\n{}}}",
+            self.header,
+            self.message_type_desc(),
+            self.chunk_count,
+            bytes_hex_format(&self.body)
+        )
     }
 }
 
@@ -502,7 +475,6 @@ pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
     Some(list)
 }
 
-
 /// # VideoTagHeader
 ///
 /// ## Frame Type
@@ -558,7 +530,12 @@ pub fn handle_video_data(bytes: &[u8], ctx: &RtmpContext) {
     let _composition_time_offset = &bytes[read_index..read_index + 3];
     read_index += 3;
 
-    log::debug!("[peer={}] video frame type = {:#04X}, acv_packet_type={:#04X}", &ctx.peer_addr, frame_type, acv_packet_type);
+    log::debug!(
+        "[peer={}] video frame type = {:#04X}, acv_packet_type={:#04X}",
+        &ctx.peer_addr,
+        frame_type,
+        acv_packet_type
+    );
 
     // AVCDecoderConfigurationRecord（AVC sequence header）
     if acv_packet_type == 0 {
@@ -625,8 +602,3 @@ pub fn handle_video_data(bytes: &[u8], ctx: &RtmpContext) {
 
     fn handle_nalu(nalu_bytes: Vec<u8>) {}
 }
-
-
-
-
-

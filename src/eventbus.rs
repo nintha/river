@@ -1,6 +1,6 @@
-use smol::channel::{Sender, Receiver};
-use dashmap::DashMap;
 use crossbeam_utils::atomic::AtomicCell;
+use dashmap::DashMap;
+use smol::channel::{Receiver, Sender};
 
 pub struct EventBus<E> {
     label: String,

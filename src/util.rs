@@ -1,12 +1,11 @@
 use chrono::Local;
-use std::io::Write;
-use std::future::Future;
 use rand::Rng;
 use std::fmt::Debug;
+use std::future::Future;
+use std::io::Write;
 
 pub fn init_logger() {
-    let env = env_logger::Env::default()
-        .filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
+    let env = env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info");
     // 设置日志打印格式
     env_logger::Builder::from_env(env)
         .format(|buf, record| {
@@ -78,15 +77,16 @@ pub fn print_hex(bytes: &[u8]) {
 
 /// 执行一个新协程，并且在错误时打印错误信息
 pub fn spawn_and_log_error<F, E>(fut: F)
-    where
-        F: Future<Output=Result<(), E>> + Send + 'static,
-        E: Debug,
+where
+    F: Future<Output = Result<(), E>> + Send + 'static,
+    E: Debug,
 {
     smol::spawn(async move {
         if let Err(e) = fut.await {
             log::error!("spawn future error, {:?}", e)
         }
-    }).detach();
+    })
+    .detach();
 }
 
 /// 生成随机字节数组
