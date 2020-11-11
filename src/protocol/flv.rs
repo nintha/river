@@ -83,6 +83,7 @@ impl AsRef<[u8]> for FlvTag {
 }
 
 /// 后台保存FLV文件
+#[allow(unused)]
 pub fn save_flv_background(stream_name: &str, peer_addr: String) {
     if let Some(eventbus) = eventbus_map().get(stream_name) {
         let flv_rx = eventbus.register_receiver();

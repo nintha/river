@@ -39,6 +39,7 @@ async fn accept(mut stream: TcpStream) -> anyhow::Result<()> {
         Connection: close\r\n\
         Transfer-Encoding: chunked\r\n\
         Cache-Control: no-cache\r\n\
+        Access-Control-Allow-Origin: *\r\n\
         \r\n\
         ";
         stream.write_all(header.as_bytes()).await?;
