@@ -20,7 +20,8 @@ impl<E: 'static + Clone> EventBus<E> {
     pub async fn publish(&self, val: E) {
         let mut dropped_senders: Vec<u64> = vec![];
 
-        let keys: Vec<u64> = self.tx_map.iter().map(|x| x.key().to_owned()).collect();
+        let mut keys: Vec<u64> = self.tx_map.iter().map(|x| x.key().to_owned()).collect();
+        let last_key = keys.pop();
 
         for key in keys {
             if let Some(entry) = self.tx_map.get(&key) {
@@ -29,6 +30,15 @@ impl<E: 'static + Clone> EventBus<E> {
                 }
             }
         }
+        // 最后一个元素可以直接发送，减少一次clone
+        if let Some(key) = last_key {
+            if let Some(entry) = self.tx_map.get(&key) {
+                if let Err(_) = entry.send(val).await {
+                    dropped_senders.push(key);
+                }
+            }
+        }
+
         for key in dropped_senders.iter() {
             self.tx_map.remove(key);
             log::info!("[EventBus][{}] remove receiver {}", self.label, key);

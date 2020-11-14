@@ -8,7 +8,6 @@ use smol::net::{TcpListener, TcpStream};
 use smol::prelude::*;
 
 use crate::eventbus::EventBus;
-use crate::protocol::flv::save_flv_background;
 use crate::protocol::rtmp::{
     ChunkMessageType, Handshake0, Handshake1, Handshake2, RtmpContext, RtmpMessage, RtmpMetaData,
 };
@@ -191,7 +190,6 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                             EventBus::with_label(ctx.stream_name.clone()),
                         );
                         ctx.is_publisher = true;
-                        save_flv_background(&ctx.stream_name, ctx.peer_addr.clone());
                         response_publish(&mut ctx).await?;
                     }
                     "play" => {
