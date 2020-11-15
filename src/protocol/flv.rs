@@ -18,6 +18,14 @@ pub const FLV_HEADER_WITH_TAG0: [u8; 13] = [
     0x00, 0x00, 0x00, 0x00, // tag0 length
 ];
 
+pub const FLV_HEADER_ONLY_VIDEO_WITH_TAG0: [u8; 13] = [
+    0x46, 0x4c, 0x56, // signature
+    0x01, // version
+    0x01, // video flag
+    0x00, 0x00, 0x00, 0x09, // header length
+    0x00, 0x00, 0x00, 0x00, // tag0 length
+];
+
 pub struct FlvTag {
     raw_data: Vec<u8>,
 }

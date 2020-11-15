@@ -235,12 +235,6 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
             }
 
             ChunkMessageType::VideoMessage => {
-                log::debug!(
-                    "[peer={}] C->S, [{}] header={:?}",
-                    ctx.peer_addr,
-                    message.message_type_desc(),
-                    message.header
-                );
                 if message.body[0] == 0x17 && message.body[1] == 0x00 {
                     let mut message_clone = message.clone();
                     message_clone.header.timestamp = 0;

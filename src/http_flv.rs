@@ -3,10 +3,11 @@ use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::{TcpListener, TcpStream};
 use smol::stream::StreamExt;
 use crate::rtmp_server::{eventbus_map, video_header_map, audio_header_map, meta_data_map};
-use crate::protocol::flv::FLV_HEADER_WITH_TAG0;
+use crate::protocol::flv::{FLV_HEADER_WITH_TAG0, FLV_HEADER_ONLY_VIDEO_WITH_TAG0};
 use crate::protocol::flv::FlvTag;
 use chrono::Local;
 use std::convert::TryFrom;
+use crate::protocol::rtmp::ChunkMessageType;
 
 pub async fn run_server(addr: &str) -> anyhow::Result<()> {
     // Open up a TCP connection and create a URL.
@@ -45,7 +46,7 @@ async fn accept(mut stream: TcpStream) -> anyhow::Result<()> {
         stream.write_all(header.as_bytes()).await?;
         stream.flush().await?;
 
-        write_chunk(&mut stream, &FLV_HEADER_WITH_TAG0).await?;
+        write_chunk(&mut stream, &FLV_HEADER_ONLY_VIDEO_WITH_TAG0).await?;
 
         // 发送sps/pps帧
         if let Some(msg) = video_header_map().get(stream_name) {
@@ -54,25 +55,23 @@ async fn accept(mut stream: TcpStream) -> anyhow::Result<()> {
             write_chunk(&mut stream, &(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
         };
         // 发送audio帧
-        if let Some(msg) = audio_header_map().get(stream_name) {
-            let flv_tag = FlvTag::try_from(msg.value().clone())?;
-            write_chunk(&mut stream, flv_tag.as_ref()).await?;
-            write_chunk(&mut stream, &(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
-        };
+        // if let Some(msg) = audio_header_map().get(stream_name) {
+        //     let flv_tag = FlvTag::try_from(msg.value().clone())?;
+        //     write_chunk(&mut stream, flv_tag.as_ref()).await?;
+        //     write_chunk(&mut stream, &(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
+        // };
 
         let ctx_begin_timestamp = Local::now().timestamp_millis();
-        let src_begin_timestamp = meta_data_map()
-            .get(stream_name)
-            .map(|x|x.begin_time)
-            .unwrap_or(ctx_begin_timestamp);
-        let begin_time_delta = (ctx_begin_timestamp - src_begin_timestamp) as u32;
-        log::info!("[HTTP] begin_time_delta={}", begin_time_delta);
-
         while let Ok(mut msg) = receiver.recv().await {
-            msg.header.timestamp = msg.header.timestamp - begin_time_delta;
-            let flv_tag = FlvTag::try_from(msg)?;
-            write_chunk(&mut stream, flv_tag.as_ref()).await?;
-            write_chunk(&mut stream, &(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
+            if ChunkMessageType::VideoMessage == msg.header.message_type {
+                msg.header.timestamp = (Local::now().timestamp_millis() - ctx_begin_timestamp) as u32;
+                let flv_tag = FlvTag::try_from(msg)?;
+                write_chunk(&mut stream, flv_tag.as_ref()).await?;
+                write_chunk(&mut stream, &(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
+                if receiver.len() > 2 {
+                    log::warn!("receiver.len={}, stream_name={}", receiver.len(), stream_name);
+                }
+            }
         }
         write_chunk(&mut stream, b"").await?;
     } else {
