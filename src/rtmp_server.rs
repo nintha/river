@@ -12,6 +12,7 @@ use crate::protocol::rtmp::{
     ChunkMessageType, Handshake0, Handshake1, Handshake2, RtmpContext, RtmpMessage, RtmpMetaData,
 };
 use crate::util::{bytes_hex_format, gen_random_bytes, print_hex, spawn_and_log_error};
+use std::convert::TryFrom;
 
 pub fn eventbus_map() -> &'static DashMap<String, EventBus<RtmpMessage>> {
     static INSTANCE: OnceCell<DashMap<String, EventBus<RtmpMessage>>> = OnceCell::new();
@@ -100,6 +101,12 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     };
 
                     ctx.ctx_begin_timestamp = Local::now().timestamp_millis();
+                    let src_begin_timestamp = meta_data_map()
+                        .get(&ctx.stream_name)
+                        .map(|x|x.begin_time)
+                        .unwrap_or(ctx.ctx_begin_timestamp);
+                    let begin_time_delta = (ctx.ctx_begin_timestamp - src_begin_timestamp + 1000) as u32;
+                    log::info!("[RTMP] begin_time_delta={}", begin_time_delta);
 
                     // 发送sps/pps帧
                     if let Some(msg) = video_header_map().get(&ctx.stream_name) {
@@ -132,8 +139,7 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     if let Some(eventbus) = eventbus_map().get(&ctx.stream_name) {
                         let receiver = eventbus.register_receiver();
                         while let Ok(mut msg) = receiver.recv().await {
-                            msg.header.timestamp =
-                                (Local::now().timestamp_millis() - ctx.ctx_begin_timestamp) as u32;
+                            msg.header.timestamp = msg.header.timestamp - begin_time_delta;
                             let chunks = msg.split_chunks_bytes(ctx.chunk_size);
                             for chunk in chunks {
                                 ctx.write_to_peer(&chunk).await?;
@@ -218,44 +224,7 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     }
                 }
                 if command == "@setDataFrame" {
-                    let mut meta_data = RtmpMetaData::default();
-                    if let Value::EcmaArray { entries } = &values[2] {
-                        for item in entries {
-                            match item.key.as_ref() {
-                                "duration" => {
-                                    meta_data.duration =
-                                        item.value.try_as_f64().unwrap_or_default();
-                                }
-                                "width" => {
-                                    meta_data.width = item.value.try_as_f64().unwrap_or_default();
-                                }
-                                "height" => {
-                                    meta_data.height = item.value.try_as_f64().unwrap_or_default();
-                                }
-                                "videocodecid" => {
-                                    meta_data.video_codec_id =
-                                        item.value.try_as_str().unwrap_or_default().to_owned();
-                                }
-                                "videodatarate" => {
-                                    meta_data.video_data_rate =
-                                        item.value.try_as_f64().unwrap_or_default();
-                                }
-                                "framerate" => {
-                                    meta_data.frame_rate =
-                                        item.value.try_as_f64().unwrap_or_default();
-                                }
-                                "audiocodecid" => {
-                                    meta_data.audio_codec_id =
-                                        item.value.try_as_str().unwrap_or_default().to_owned();
-                                }
-                                "audiodatarate" => {
-                                    meta_data.audio_data_rate =
-                                        item.value.try_as_f64().unwrap_or_default();
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                    let meta_data = RtmpMetaData::try_from(&values[2])?;
                     meta_data_map().insert(ctx.stream_name.clone(), meta_data);
                     log::info!(
                         "[peer={}] C->S, cache meta_data, stream_name={}",

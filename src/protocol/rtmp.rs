@@ -10,6 +10,7 @@ use smol::net::TcpStream;
 
 use crate::rtmp_server::eventbus_map;
 use crate::util::bytes_hex_format;
+use std::convert::TryFrom;
 
 #[derive(Clone, Debug)]
 pub struct Handshake0 {
@@ -338,7 +339,7 @@ impl RtmpMessage {
             22 => "CommandMessages::AggregateMessage",
             _ => "UnknownMessage",
         }
-        .to_string()
+            .to_string()
     }
 
     /// 把body数据解析成amf0格式
@@ -421,6 +422,55 @@ pub struct RtmpMetaData {
     pub audio_data_rate: f64,
     pub frame_rate: f64,
     pub duration: f64,
+    pub begin_time: i64,
+}
+
+impl TryFrom<&amf::amf0::Value> for RtmpMetaData {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &amf::amf0::Value) -> Result<Self, Self::Error> {
+        let mut meta_data = RtmpMetaData::default();
+        if let Value::EcmaArray { entries } = value {
+            for item in entries {
+                match item.key.as_ref() {
+                    "duration" => {
+                        meta_data.duration = item.value.try_as_f64().unwrap_or_default();
+                    }
+                    "width" => {
+                        meta_data.width = item.value.try_as_f64().unwrap_or_default();
+                    }
+                    "height" => {
+                        meta_data.height = item.value.try_as_f64().unwrap_or_default();
+                    }
+                    "videocodecid" => {
+                        meta_data.video_codec_id =
+                            item.value.try_as_str().unwrap_or_default().to_owned();
+                    }
+                    "videodatarate" => {
+                        meta_data.video_data_rate =
+                            item.value.try_as_f64().unwrap_or_default();
+                    }
+                    "framerate" => {
+                        meta_data.frame_rate =
+                            item.value.try_as_f64().unwrap_or_default();
+                    }
+                    "audiocodecid" => {
+                        meta_data.audio_codec_id =
+                            item.value.try_as_str().unwrap_or_default().to_owned();
+                    }
+                    "audiodatarate" => {
+                        meta_data.audio_data_rate =
+                            item.value.try_as_f64().unwrap_or_default();
+                    }
+                    _ => {}
+                }
+            }
+            meta_data.begin_time = Local::now().timestamp_millis();
+            Ok(meta_data)
+        } else {
+            Err(anyhow::anyhow!("value is not Value::EcmaArray"))?
+        }
+    }
 }
 
 pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {

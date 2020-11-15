@@ -2,7 +2,7 @@ use crate::util::spawn_and_log_error;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::{TcpListener, TcpStream};
 use smol::stream::StreamExt;
-use crate::rtmp_server::{eventbus_map, video_header_map, audio_header_map};
+use crate::rtmp_server::{eventbus_map, video_header_map, audio_header_map, meta_data_map};
 use crate::protocol::flv::FLV_HEADER_WITH_TAG0;
 use crate::protocol::flv::FlvTag;
 use chrono::Local;
@@ -61,8 +61,15 @@ async fn accept(mut stream: TcpStream) -> anyhow::Result<()> {
         };
 
         let ctx_begin_timestamp = Local::now().timestamp_millis();
+        let src_begin_timestamp = meta_data_map()
+            .get(stream_name)
+            .map(|x|x.begin_time)
+            .unwrap_or(ctx_begin_timestamp);
+        let begin_time_delta = (ctx_begin_timestamp - src_begin_timestamp) as u32;
+        log::info!("[HTTP] begin_time_delta={}", begin_time_delta);
+
         while let Ok(mut msg) = receiver.recv().await {
-            msg.header.timestamp = (Local::now().timestamp_millis() - ctx_begin_timestamp) as u32;
+            msg.header.timestamp = msg.header.timestamp - begin_time_delta;
             let flv_tag = FlvTag::try_from(msg)?;
             write_chunk(&mut stream, flv_tag.as_ref()).await?;
             write_chunk(&mut stream, &(flv_tag.as_ref().len() as u32).to_be_bytes()).await?;
