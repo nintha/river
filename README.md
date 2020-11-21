@@ -1,5 +1,5 @@
 # River
-RTMP Live Stream Server
+Pure Rust Implementation of RTMP Live Stream Server
 
 ## Push
 
