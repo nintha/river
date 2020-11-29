@@ -19,7 +19,8 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 - [x] 支持HTTP-FLV输出
 
 ## TODO
-- [ ] Web GUI 播放界面
+- [ ] Web GUI 播放界面(FLV)
+- [ ] 输出H264流，使用[Jmuxer](https://github.com/samirkumardas/jmuxer)在浏览器中播放
 
 ## 参考资料
 - [RTMP推送AAC ADTS音频流](https://www.jianshu.com/p/1a6f195863c7)
