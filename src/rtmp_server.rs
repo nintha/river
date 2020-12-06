@@ -288,7 +288,7 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         zero: BigEndian::read_u32(&c1_vec[4..8]),
         random_data: c1_vec[8..Handshake1::PACKET_LENGTH as usize].to_vec(),
     };
-    log::info!("[peer={}] C1, {:?}", ctx.peer_addr, c1);
+    log::info!("[peer={}] C1", ctx.peer_addr);
 
     /* S0/S1/S2 */
     ctx.write_to_peer(Handshake0::S0_V3.to_bytes().as_ref())
@@ -305,7 +305,7 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         random_data: gen_random_bytes(1528),
     };
     ctx.write_to_peer(s1.to_bytes().as_ref()).await?;
-    log::info!("[peer={}] S1, {:?}", ctx.peer_addr, s1);
+    log::info!("[peer={}] S1", ctx.peer_addr);
 
     let s2 = Handshake2 {
         time: c1.time,
@@ -313,7 +313,7 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         random_echo: c1.random_data,
     };
     ctx.write_to_peer(s2.to_bytes().as_ref()).await?;
-    log::info!("[peer={}] S2, {:?}", ctx.peer_addr, s2);
+    log::info!("[peer={}] S2", ctx.peer_addr);
 
     /* C2*/
     let c2_vec = ctx.read_exact_from_peer(Handshake2::PACKET_LENGTH).await?;
@@ -322,7 +322,7 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         time2: BigEndian::read_u32(&c2_vec[4..8]),
         random_echo: c2_vec[8..Handshake2::PACKET_LENGTH as usize].to_vec(),
     };
-    log::info!("[peer={}] C2, {:?}", ctx.peer_addr, c2);
+    log::info!("[peer={}] C2", ctx.peer_addr);
     assert_eq!(s1.random_data, c2.random_echo);
 
     ctx.recv_bytes_num += 1 + Handshake1::PACKET_LENGTH + Handshake2::PACKET_LENGTH;
