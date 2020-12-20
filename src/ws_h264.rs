@@ -7,7 +7,10 @@ use smol::net::{SocketAddr, TcpListener, TcpStream};
 
 use crate::protocol::h264::Nalu;
 use crate::rtmp_server::{eventbus_map, video_header_map};
-use crate::protocol::rtmp::ChunkMessageType;
+use crate::protocol::rtmp::{ChunkMessageType, RtmpMessage};
+use smol::channel::Receiver;
+use smol::stream::{Stream};
+use smol::stream;
 
 #[allow(unused)]
 pub(crate) async fn run_server(addr: &str) -> anyhow::Result<()> {
@@ -53,26 +56,56 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr) -> anyhow::R
         let rx = el.register_receiver();
         std::mem::drop(el);
 
+        let rx = rtmp_rx_into_nalu_rx(rx);
+        futures::pin_mut!(rx);
+        while let Some(nalu) = StreamExt::next(&mut rx).await{
+            outgoing.send(Message::binary(nalu.as_ref())).await?;
+        }
+
         // 第一个关键帧是否出现
-        let mut first_key_frame = false;
+        // let mut first_key_frame = false;
+        // while let Ok(msg) = rx.recv().await {
+        //     if msg.header.message_type != ChunkMessageType::VideoMessage {
+        //         continue;
+        //     }
+        //
+        //     for nalu in Nalu::from_rtmp_message(&msg) {
+        //         if !first_key_frame {
+        //             if nalu.is_key_frame {
+        //                 first_key_frame = true;
+        //             } else {
+        //                 continue;
+        //             }
+        //         }
+        //         outgoing.send(Message::binary(nalu.as_ref())).await?;
+        //     }
+        // }
+    }
+    log::info!("WebSocket disconnected: {}, stream_name={}", addr, stream_name);
+    Ok(())
+}
+
+// 把RMTP流转换城NALU流，并保证首帧为关键帧
+fn rtmp_rx_into_nalu_rx(rx: Receiver<RtmpMessage>) -> impl Stream<Item=Nalu> {
+    stream::unfold((rx, false), |(rx, first_key_frame)| async move {
         while let Ok(msg) = rx.recv().await {
             if msg.header.message_type != ChunkMessageType::VideoMessage {
                 continue;
             }
 
-            for nalu in Nalu::from_rtmp_message(&msg) {
-                if !first_key_frame {
-                    if nalu.is_key_frame {
-                        first_key_frame = true;
-                    } else {
-                        continue;
-                    }
-                }
-                outgoing.send(Message::binary(nalu.as_ref())).await?;
+            let nalus = Nalu::from_rtmp_message(&msg);
+            if first_key_frame {
+                return Some((stream::iter(nalus), (rx, first_key_frame)));
             }
+
+            let nalus = nalus.into_iter().skip_while(|nalu| !nalu.is_key_frame).collect::<Vec<Nalu>>();
+
+            if nalus.is_empty(){
+                continue;
+            }
+            return Some((stream::iter(nalus), (rx, true)));
         }
-    }
-    log::info!("WebSocket disconnected: {}, stream_name={}", addr, stream_name);
-    Ok(())
+        None
+    }).flatten()
 }
 
