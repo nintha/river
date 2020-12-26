@@ -25,8 +25,31 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 - [x] 输出H264流，使用[Jmuxer](https://github.com/samirkumardas/jmuxer)在浏览器中播放
 
 ## TODO
-- [ ] Web GUI 播放界面(FLV)
+- [ ] Web GUI 播放界面(Jmuxer)
 
+## FAQ
+
+### 处理Chrome浏览器会暂停非活动标签页中无声视频的问题
+
+- 监听相关事件，手动调整视频播放进度
+
+```js
+var video = document.createElement('video');
+document.addEventListener("visibilitychange", function() {
+  video.currentTime = video.buffered.end(0);
+});
+```
+- 定时检查已缓冲的视频长度，追踪播放进度
+```js
+var video = document.createElement('video');
+setInterval(()=>{
+  var latest = video.buffered.end(0);
+  // 超过200ms
+  if (latest - video.currentTime > 0.2){
+    video.currentTime = latest;
+  }
+}, 1000);
+```
 
 ## 参考资料
 - [RTMP推送AAC ADTS音频流](https://www.jianshu.com/p/1a6f195863c7)
