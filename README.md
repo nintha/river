@@ -3,7 +3,7 @@ Pure Rust Implementation of RTMP Live Stream Server
 
 ## Push
 
-OBS
+OBS, x264, tune=zerolatency, CBR, perset=veryfast, porfile=baseline
 
 ## Play
 
@@ -34,14 +34,14 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 - 监听相关事件，手动调整视频播放进度
 
 ```js
-var video = document.createElement('video');
+var video = document.getElementById('video');
 document.addEventListener("visibilitychange", function() {
   video.currentTime = video.buffered.end(0);
 });
 ```
 - 定时检查已缓冲的视频长度，追踪播放进度
 ```js
-var video = document.createElement('video');
+var video = document.getElementById('video');
 setInterval(()=>{
   var latest = video.buffered.end(0);
   // 超过200ms

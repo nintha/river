@@ -61,25 +61,6 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr) -> anyhow::R
         while let Some(nalu) = StreamExt::next(&mut rx).await{
             outgoing.send(Message::binary(nalu.as_ref())).await?;
         }
-
-        // 第一个关键帧是否出现
-        // let mut first_key_frame = false;
-        // while let Ok(msg) = rx.recv().await {
-        //     if msg.header.message_type != ChunkMessageType::VideoMessage {
-        //         continue;
-        //     }
-        //
-        //     for nalu in Nalu::from_rtmp_message(&msg) {
-        //         if !first_key_frame {
-        //             if nalu.is_key_frame {
-        //                 first_key_frame = true;
-        //             } else {
-        //                 continue;
-        //             }
-        //         }
-        //         outgoing.send(Message::binary(nalu.as_ref())).await?;
-        //     }
-        // }
     }
     log::info!("WebSocket disconnected: {}, stream_name={}", addr, stream_name);
     Ok(())

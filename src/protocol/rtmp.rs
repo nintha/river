@@ -137,6 +137,13 @@ impl RtmpContext {
         Ok(data)
     }
 
+    /// Receives data without removing it from the queue.
+    pub async fn peek_exact_from_peer(&mut self, bytes_num: u32) -> anyhow::Result<Vec<u8>> {
+        let mut data = vec![0u8; bytes_num as usize];
+        self.stream.peek(&mut data).await?;
+        Ok(data)
+    }
+
     pub async fn write_to_peer(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         self.stream.write_all(bytes).await?;
         Ok(())
@@ -473,6 +480,7 @@ impl TryFrom<&amf::amf0::Value> for RtmpMetaData {
     }
 }
 
+/// 计算一个AMF值的字节长度
 pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
     match v {
         Value::Number(_) => 9,
@@ -505,6 +513,7 @@ pub fn calc_amf_byte_len(v: &amf0::Value) -> usize {
     }
 }
 
+/// 从字节数组中读取全部的AMF值
 pub fn read_all_amf_value(bytes: &[u8]) -> Option<Vec<Value>> {
     let mut read_num = 0;
     let mut list = Vec::new();

@@ -103,7 +103,7 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                     ctx.ctx_begin_timestamp = Local::now().timestamp_millis();
                     let src_begin_timestamp = meta_data_map()
                         .get(&ctx.stream_name)
-                        .map(|x|x.begin_time)
+                        .map(|x| x.begin_time)
                         .unwrap_or(ctx.ctx_begin_timestamp);
                     let begin_time_delta = (ctx.ctx_begin_timestamp - src_begin_timestamp + 1000) as u32;
                     log::info!("[RTMP] begin_time_delta={}", begin_time_delta);
@@ -277,6 +277,8 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
 }
 
 /// 处理RTMP握手流程
+///
+/// 有时候OBS在握手流程中会发送ACK报文
 async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
     /* C0/C1 */
     let c0 = ctx.read_exact_from_peer(1).await?[0];
@@ -288,21 +290,22 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         zero: BigEndian::read_u32(&c1_vec[4..8]),
         random_data: c1_vec[8..Handshake1::PACKET_LENGTH as usize].to_vec(),
     };
-    log::info!("[peer={}] C1", ctx.peer_addr);
+    log::info!("[peer={}] C1，time={}, zero={}, last12=0x{:02X?}", ctx.peer_addr, c1.time, c1.zero, &c1_vec[Handshake1::PACKET_LENGTH as usize - 12..]);
 
     /* S0/S1/S2 */
     ctx.write_to_peer(Handshake0::S0_V3.to_bytes().as_ref())
         .await?;
-    log::info!(
-        "[peer={}] S0, version={:?}",
-        ctx.peer_addr,
-        Handshake0::S0_V3
-    );
+    log::info!("[peer={}] S0, version={:?}", ctx.peer_addr, Handshake0::S0_V3);
+
 
     let s1 = Handshake1 {
         time: (Local::now().timestamp_millis() - ctx.ctx_begin_timestamp) as u32,
         zero: 0,
-        random_data: gen_random_bytes(1528),
+        random_data: {
+            let mut random_bytes = gen_random_bytes(1528);
+            random_bytes[0] = 0x0; // 首字符置0
+            random_bytes
+        },
     };
     ctx.write_to_peer(s1.to_bytes().as_ref()).await?;
     log::info!("[peer={}] S1", ctx.peer_addr);
@@ -315,6 +318,12 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
     ctx.write_to_peer(s2.to_bytes().as_ref()).await?;
     log::info!("[peer={}] S2", ctx.peer_addr);
 
+    let peek_len = 12;
+    let peek_vec = ctx.peek_exact_from_peer(peek_len).await?;
+    if peek_vec != &s1.to_bytes()[0..peek_len as usize] {
+        log::info!("[peer={}] ACK in handshake, peek=0x{:02X?}, s1_part=0x{:02X?}", ctx.peer_addr, peek_vec, &s1.to_bytes()[0..peek_len as usize]);
+        let _ = RtmpMessage::read_from(ctx).await?;
+    }
     /* C2*/
     let c2_vec = ctx.read_exact_from_peer(Handshake2::PACKET_LENGTH).await?;
     let c2 = Handshake2 {
@@ -322,7 +331,7 @@ async fn handle_rtmp_handshake(ctx: &mut RtmpContext) -> anyhow::Result<()> {
         time2: BigEndian::read_u32(&c2_vec[4..8]),
         random_echo: c2_vec[8..Handshake2::PACKET_LENGTH as usize].to_vec(),
     };
-    log::info!("[peer={}] C2", ctx.peer_addr);
+    log::info!("[peer={}] C2, time=0x{:02X?}, time2=0x{:02X?}", ctx.peer_addr, &c2_vec[0..4], &c2_vec[4..8]);
     assert_eq!(s1.random_data, c2.random_echo);
 
     ctx.recv_bytes_num += 1 + Handshake1::PACKET_LENGTH + Handshake2::PACKET_LENGTH;
@@ -386,7 +395,7 @@ async fn response_connect(ctx: &mut RtmpContext) -> anyhow::Result<()> {
                 },
             ],
         }
-        .write_to(&mut response_result)?;
+            .write_to(&mut response_result)?;
         amf::amf0::Value::Object {
             class_name: None,
             entries: vec![
@@ -408,7 +417,7 @@ async fn response_connect(ctx: &mut RtmpContext) -> anyhow::Result<()> {
                 },
             ],
         }
-        .write_to(&mut response_result)?;
+            .write_to(&mut response_result)?;
         response_result[6] = (response_result.len() - 12) as u8;
         ctx.write_to_peer(response_result.as_ref()).await?;
         log::info!("[peer={}] S->C, response_result:", ctx.peer_addr);
@@ -461,7 +470,7 @@ async fn response_publish(ctx: &mut RtmpContext) -> anyhow::Result<()> {
             },
         ],
     }
-    .write_to(&mut response_result)?;
+        .write_to(&mut response_result)?;
     response_result[6] = (response_result.len() - 12) as u8;
     ctx.write_to_peer(response_result.as_ref()).await?;
     log::info!("[peer={}] S->C, Start publishing:", ctx.peer_addr);
@@ -507,7 +516,7 @@ async fn response_play(ctx: &mut RtmpContext, stream_id: u32) -> anyhow::Result<
                 },
             ],
         }
-        .write_to(&mut response_result)?;
+            .write_to(&mut response_result)?;
         response_result[6] = (response_result.len() - 12) as u8;
         ctx.write_to_peer(response_result.as_ref()).await?;
         log::info!("[peer={}] S->C, Start play:", ctx.peer_addr);
@@ -606,7 +615,7 @@ async fn send_meta_data_for_play(
             },
         ],
     }
-    .write_to(&mut response_result)?;
+        .write_to(&mut response_result)?;
     let be_bytes: [u8; 2] = ((response_result.len() - 12) as u16).to_be_bytes();
     response_result[5] = be_bytes[0];
     response_result[6] = be_bytes[1];
