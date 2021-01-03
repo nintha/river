@@ -1,7 +1,9 @@
 use crate::protocol::rtmp::{RtmpMessage, ChunkMessageType};
 
 /// # AAC rtmp头部信息封装
+/// AAC音频文件的每一帧都由一个ADTS头和AAC ES(AAC音频数据)组成。
 ///
+/// 以下是AAC音频数据格式
 /// 第一个byte包含音频的编码参数：
 /// ```
 /// 1-4bit: audioCodeId
@@ -23,41 +25,49 @@ use crate::protocol::rtmp::{RtmpMessage, ChunkMessageType};
 /// 就选一个接近的。
 /// 2) 第2个byte ： 0x01 表示是raw data
 /// 3) 第3byte开始 ： 去掉前7个byte的AAC头之后的AAC数据。
-///
-/// ## G.711U rtmp头部信息封装
-/// 1) 第1个byte ： audioCodeId=8，如果是11KHZ、16bit、单声道，
-/// 第一个byte是0x86。如果实际采样率不是5.5KHZ、11KHZ、22KHZ、44KHZ，
-/// 就选一个接近的。
-/// 2) 第2个byte开始是存放G.711U数据。
-///
-/// ## G.711A rtmp头部信息封装
-/// 1) 第1个byte ： audioCodeId=7，如果是11KHZ、16bit、单声道，
-/// 第一个byte是0x76。如果实际采样率不是5.5KHZ、11KHZ、22KHZ、44KHZ，
-/// 就选一个接近的。
-/// 2) 第2个byte开始是存放G.711A数据。
-pub struct Aac {
+pub struct AAC {
     inner: Vec<u8>,
 }
 
 #[allow(unused)]
-impl Aac {
-    pub fn from_rtmp_message(msg: &RtmpMessage) -> Option<Self> {
+impl AAC {
+    pub fn from_rtmp_message(msg: &RtmpMessage, header: &RtmpMessage) -> Option<Self> {
         if msg.header.message_type != ChunkMessageType::AudioMessage {
             return None;
         }
 
-        let bytes = &msg.body;
+        let adts_header = AAC::gen_adts_header(msg.body.len() as u16);
+
+        let mut bytes = vec![];
+        bytes.extend_from_slice(&adts_header);
+        bytes.extend_from_slice(&msg.body);
         Some(Self {
-            inner: bytes.to_owned(),
+            inner: bytes,
         })
+    }
+
+    fn gen_adts_header(len: u16) -> [u8; 7] {
+        let len = len + 7;
+        let mut header = [0xFF, 0xF1, 0x50, 0x20, 0x00, 0x3F, 0xFC];
+        let byte3 = 0b0000_0011u8 & ((len >> 12) as u8);
+        header[3] |= byte3;
+        let byte4 = (len << 5 >> 3) as u8;
+        header[4] |= byte4;
+        let byte5 = (len << 5) as u8;
+        header[5] |= byte5;
+        header
     }
 
     pub fn is_sequence_header(&self) -> bool {
         self.inner[1] == 0x00
     }
+
+    pub fn is_raw_data(&self) -> bool {
+        self.inner[1] != 0x00
+    }
 }
 
-impl AsRef<[u8]> for Aac {
+impl AsRef<[u8]> for AAC {
     fn as_ref(&self) -> &[u8] {
         &self.inner
     }
