@@ -72,3 +72,41 @@ impl AsRef<[u8]> for AAC {
         &self.inner
     }
 }
+
+pub struct ADTS {
+    // 1 bit; 0: MPEG-4, 1: MPEG-2
+    pub id: bool,
+    // 1 bit; 0: CRC, 1: no-CRC
+    pub protection_absent: bool,
+    /// 2 bits; the MPEG-4 Audio Object Type minus 1
+    pub profile: u8,
+    /// 4 bits; 15 is forbidden
+    pub sampling_frequency_index: u8,
+    /// set to 0 when encoding, ignore when decoding
+    pub private_bit: bool,
+    /// 3 bits;
+    pub channel_configuration: u8,
+    pub originality: bool,
+    pub home: bool,
+    pub copyright_identification_bit: bool,
+    pub copyright_identification_start: bool,
+    // 13 bits;
+    pub aac_frame_lenght: u16,
+    // 11 bits;
+    pub adts_buffer_fullness: u16,
+    // 2 bits;
+    pub no_raw_data_blocks_in_frame: u8,
+    /// 16 bits;
+    pub crc: u16,
+}
+
+impl ADTS {
+    /// 12 bits
+    pub const SYNC_WORD: u16 = 0xFFF;
+    /// 2 bits
+    pub const LAYER: u8 = 0;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        unimplemented!()
+    }
+}
