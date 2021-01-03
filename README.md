@@ -22,10 +22,11 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 - [x] 支持不同分辨率的推流和拉流（之前默认1028x720）
 - [x] 支持音频传输
 - [x] 支持HTTP-FLV输出
-- [x] 输出H264流，使用[Jmuxer](https://github.com/samirkumardas/jmuxer)在浏览器中播放
+- [x] 输出H264流，使用[Jmuxer](https://github.com/samirkumardas/jmuxer)在浏览器中播放（视频+音频）
 
 ## TODO
-- [ ] Web GUI 播放界面(Jmuxer)
+- [ ] 推流端认证
+- [ ] 处理websocket消息积压的问题
 
 ## FAQ
 

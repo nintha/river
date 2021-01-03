@@ -59,6 +59,8 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr) -> anyhow::R
 
         let rx = rtmp_rx_into_mix_rx(rx, stream_name.to_string());
         futures::pin_mut!(rx);
+
+        // TODO 消息挤压问题需要解决
         while let Some(mix) = StreamExt::next(&mut rx).await {
             outgoing.send(Message::binary(mix.to_bytes())).await?;
         }
