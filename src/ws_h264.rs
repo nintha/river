@@ -11,7 +11,7 @@ use crate::protocol::rtmp::{ChunkMessageType, RtmpMessage};
 use smol::channel::Receiver;
 use smol::stream::{Stream};
 use smol::stream;
-use crate::protocol::aac::AAC;
+use crate::protocol::aac::{AAC, ADTS};
 
 #[allow(unused)]
 pub(crate) async fn run_server(addr: &str) -> anyhow::Result<()> {
@@ -94,7 +94,7 @@ fn rtmp_rx_into_mix_rx(rx: Receiver<RtmpMessage>, stream_name: String) -> impl S
 /// 媒体混合数据
 enum Mix {
     Video(Nalu),
-    Audio(AAC),
+    Audio(ADTS),
 }
 
 impl Mix {
@@ -107,7 +107,12 @@ impl Mix {
             }
             ChunkMessageType::AudioMessage => {
                 if let Some(header) = audio_header_map().get(stream_name) {
-                    AAC::from_rtmp_message(&msg, header.value()).into_iter().map(Mix::Audio).collect()
+                    AAC::from_rtmp_message(&msg, header.value())
+                        .into_iter()
+                        .map(|x| x.to_adts())
+                        .flatten()
+                        .map(Mix::Audio)
+                        .collect()
                 } else {
                     vec![]
                 }
@@ -141,7 +146,7 @@ impl Mix {
             }
             Mix::Audio(aac) => {
                 let mut bytes = vec![Mix::AUDIO_FLAG];
-                bytes.extend_from_slice(aac.as_ref());
+                bytes.extend_from_slice(&aac.to_bytes());
                 bytes
             }
         }
