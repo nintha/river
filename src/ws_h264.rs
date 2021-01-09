@@ -60,7 +60,6 @@ async fn handle_connection(raw_stream: TcpStream, addr: SocketAddr) -> anyhow::R
         let rx = rtmp_rx_into_mix_rx(rx, stream_name.to_string());
         futures::pin_mut!(rx);
 
-        // TODO 消息挤压问题需要解决
         while let Some(mix) = StreamExt::next(&mut rx).await {
             outgoing.send(Message::binary(mix.to_bytes())).await?;
         }
@@ -82,11 +81,17 @@ fn rtmp_rx_into_mix_rx(rx: Receiver<RtmpMessage>, stream_name: String) -> impl S
                 return Some((stream::iter(mixes), (rx, first_key_frame, stream_name)));
             }
 
-            let mixes = mixes.into_iter().skip_while(|mix| !mix.is_key_frame()).collect::<Vec<Mix>>();
+            let mut mixes = mixes.into_iter().skip_while(|mix| !mix.is_key_frame()).collect::<Vec<Mix>>();
+
+            // 消息堆积，丢弃非关键帧
+            if rx.len() > 3 {
+                mixes.retain(|x| x.is_key_frame());
+            }
 
             if mixes.is_empty() {
                 continue;
             }
+
             return Some((stream::iter(mixes), (rx, true, stream_name)));
         }
         None
