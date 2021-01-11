@@ -27,6 +27,7 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 
 ## TODO
 - [ ] 推流端认证
+- [ ] 可配置的启动参数
 
 ## FAQ
 
