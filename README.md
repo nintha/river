@@ -24,10 +24,11 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 - [x] 支持HTTP-FLV输出
 - [x] 输出H264流，使用[Jmuxer](https://github.com/samirkumardas/jmuxer)在浏览器中播放（视频+音频）
 - [x] 处理websocket消息积压的问题
+- [x] 可配置的启动参数(监听的服务器端口)
 
 ## TODO
 - [ ] 推流端认证
-- [ ] 可配置的启动参数
+
 
 ## FAQ
 

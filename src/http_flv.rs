@@ -9,7 +9,7 @@ use chrono::Local;
 use std::convert::TryFrom;
 use crate::protocol::rtmp::ChunkMessageType;
 
-pub async fn run_server(addr: &str) -> anyhow::Result<()> {
+pub async fn run_server(addr: String) -> anyhow::Result<()> {
     // Open up a TCP connection and create a URL.
     let listener = TcpListener::bind(addr).await?;
     let addr = format!("http://{}", listener.local_addr()?);
