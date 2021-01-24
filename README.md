@@ -11,31 +11,33 @@ OBS, x264, tune=zerolatency, CBR, perset=veryfast, porfile=baseline
 ```shell
 ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/token
 ```
-使用`-fflags nobuffer -analyzeduration 100000`可以有效降低播放的延迟，目前本地测试延迟大概为1秒
+ `-fflags nobuffer -analyzeduration 100000` could reduce the latency. In my computer, the latency is about 1 second.
 
 ### JMuxer
-使用[Jmuxer](https://github.com/samirkumardas/jmuxer)在浏览器中播放，详见`example/h264-nalu-stream`目录。
+Playing in the browser with [Jmuxer](https://github.com/samirkumardas/jmuxer).
 
-如果是使用x264编码推流，建议profile=baseline，可以避免视频频繁抖动，目前本地测试延迟大概为1秒
+If pushing stream with x264 codec, recommand profile is baseline 
+
+If you are using x264 encoding to push the stream, it is recommended that profile=baseline to avoid frequent video jitter. The current local test latency is about 1 second.
 
 ## Completed
-- [x] 支持不同分辨率的推流和拉流（之前默认1028x720）
-- [x] 支持音频传输
-- [x] 支持HTTP-FLV输出
-- [x] 输出H264流，使用[Jmuxer](https://github.com/samirkumardas/jmuxer)在浏览器中播放（视频+音频）
-- [x] 处理websocket消息积压的问题
-- [x] 可配置的启动参数(监听的服务器端口)
+- [x] support custom width and height
+- [x] support audio
+- [x] support HTTP-FLV output
+- [x] support raw H264 stream output
+- [x] Deal with the problem of websocket message backlog
+- [x] Configurable startup parameters (monitoring server port)
 
 ## TODO
-- [ ] 推流端认证
-- [ ] 输出Fragmented MP4
+- [ ] PUSH/PULL authentication
+- [ ] support  fragmented MP4 output
 
 
 ## FAQ
 
-### 处理Chrome浏览器会暂停非活动标签页中无声视频的问题
+### The Chrome auto pauses muted video in inactive tabs.
 
-- 监听相关事件，手动调整视频播放进度
+- Listen to the event `visibilitychange`, and change Video playback progress manually
 
 ```js
 var video = document.getElementById('video');
@@ -43,19 +45,19 @@ document.addEventListener("visibilitychange", function() {
   video.currentTime = video.buffered.end(0);
 });
 ```
-- 定时检查已缓冲的视频长度，追踪播放进度
+- Timed changing Video playback progress manually
 ```js
 var video = document.getElementById('video');
 setInterval(()=>{
   var latest = video.buffered.end(0);
-  // 超过200ms
+  // over 200ms
   if (latest - video.currentTime > 0.2){
     video.currentTime = latest;
   }
 }, 1000);
 ```
 
-## 参考资料
+## Reference
 - [RTMP推送AAC ADTS音频流](https://www.jianshu.com/p/1a6f195863c7)
 - [视音频数据处理入门](https://blog.csdn.net/leixiaohua1020/article/details/50534369)
 - [rtmp数据封装](https://blog.csdn.net/Jacob_job/article/details/81880445)
