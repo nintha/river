@@ -28,6 +28,7 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 
 ## TODO
 - [ ] 推流端认证
+- [ ] 输出Fragmented MP4
 
 
 ## FAQ
