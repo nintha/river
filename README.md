@@ -30,7 +30,7 @@ If you are using x264 encoding to push the stream, it is recommended that profil
 
 ## TODO
 - [ ] PUSH/PULL authentication
-- [ ] support  fragmented MP4 output
+- [ ] support fragmented MP4 output
 
 
 ## FAQ
