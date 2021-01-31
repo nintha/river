@@ -1,6 +1,20 @@
 # River
 Pure Rust Implementation of RTMP Live Stream Server
 
+## Usage
+USAGE:
+    river.exe [OPTIONS]
+
+FLAGS:
+    -h, --help       Prints help information
+    -V, --version    Prints version information
+
+OPTIONS:
+        --http-flv-port <http-flv-port>    [default: 8080]
+        --rtmp-port <rtmp-port>            [default: 1935]
+        --ws-fmp4-port <ws-fmp4-port>      [default: 8082]
+        --ws-h264-port <ws-h264-port>      [default: 8081]
+
 ## Push
 
 OBS, x264, tune=zerolatency, CBR, perset=veryfast, porfile=baseline
