@@ -419,7 +419,7 @@ pub enum ChunkMessageType {
     AggregateMessage = 22,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RtmpMetaData {
     pub width: f64,
     pub height: f64,

@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ByteOrder};
 
-use crate::protocol::rtmp::{RtmpContext, RtmpMessage};
+use crate::protocol::rtmp::{RtmpContext, RtmpMessage, ChunkMessageType};
 
 /// H264编码数据存储或传输的基本单元
 pub struct Nalu {
@@ -9,8 +9,15 @@ pub struct Nalu {
 }
 
 impl Nalu {
+    pub const UNIT_TYPE_SPS: u8 = 7;
+    pub const UNIT_TYPE_PPS: u8 = 8;
+
     /// RtmpMessage to Nalus
     pub fn from_rtmp_message(msg: &RtmpMessage) -> Vec<Nalu> {
+        if msg.header.message_type != ChunkMessageType::VideoMessage {
+            return vec![];
+        }
+
         let bytes = &msg.body;
         let mut nalus = vec![];
 
@@ -78,7 +85,7 @@ impl Nalu {
     /// 帧类型
     #[allow(unused)]
     pub fn get_nal_unit_type(&self) -> u8 {
-        self.inner[0] & 0x1F
+        self.inner[4] & 0x1F
     }
 
     #[allow(unused)]
@@ -108,6 +115,27 @@ impl Nalu {
         };
 
         format!("{}::{}", priority, t)
+    }
+
+    pub fn to_avcc_format(&self) -> Vec<u8> {
+        let origin = self.as_ref();
+        let mut bytes = vec![0x00, 0x00, 0x00, 0x00];
+        for i in 4..origin.len() {
+            // remove prevention byte
+            if origin[i - 2] == 0 && origin[i - 1] == 0 && origin[i] == 3 {
+                if i < origin.len() && [0u8, 1, 2, 3].contains(&origin[i + 1]) {
+                    continue;
+                }
+            }
+
+            bytes.push(origin[i]);
+        }
+        let len = (bytes.len() - 4) as u32;
+        bytes[0] = (len >> 24) as u8;
+        bytes[1] = (len >> 16) as u8;
+        bytes[2] = (len >> 8) as u8;
+        bytes[3] = len as u8;
+        bytes
     }
 }
 
@@ -234,7 +262,7 @@ pub fn handle_video_data(bytes: &[u8], ctx: &RtmpContext) {
             // println!("NALU Type: {}, len={}", nalu_type_desc(&data[0]), data_len);
             // println!("len={}, nalu data:\n{}", data_len, bytes_hex_format(data));
 
-            let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x01];
+            let mut nalu_bytes: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
             nalu_bytes.extend_from_slice(data);
             handle_nalu(nalu_bytes);
         }

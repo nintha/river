@@ -13,6 +13,7 @@ use crate::protocol::rtmp::{
 };
 use crate::util::{bytes_hex_format, gen_random_bytes, print_hex, spawn_and_log_error};
 use std::convert::TryFrom;
+use crate::protocol::fmp4::save_fmp4_background;
 
 pub fn eventbus_map() -> &'static DashMap<String, EventBus<RtmpMessage>> {
     static INSTANCE: OnceCell<DashMap<String, EventBus<RtmpMessage>>> = OnceCell::new();
@@ -244,6 +245,8 @@ async fn connection_loop(stream: TcpStream) -> anyhow::Result<()> {
                         ctx.peer_addr,
                         ctx.stream_name
                     );
+
+                    save_fmp4_background(&ctx.stream_name, ctx.peer_addr.clone());
                 }
                 if let Some(eventbus) = eventbus_map().get(&ctx.stream_name) {
                     eventbus.publish(message.clone()).await;

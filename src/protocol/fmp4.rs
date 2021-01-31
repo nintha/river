@@ -1,4 +1,10 @@
 use std::{u32, vec};
+use crate::rtmp_server::{eventbus_map, meta_data_map, video_header_map};
+use crate::util::spawn_and_log_error;
+use smol::channel::Receiver;
+use crate::protocol::rtmp::RtmpMessage;
+use crate::protocol::h264::Nalu;
+use smol::io::AsyncWriteExt;
 
 /// fps = timescale / duration
 #[derive(Clone)]
@@ -15,13 +21,14 @@ pub struct Track {
 }
 
 impl Track {
-    pub const DEFAULT_TIMESCALE: u32 = 1000;
+    pub const DEFAULT_TIMESCALE: u32 = 1000_000;
+    pub const DEFAULT_ID: u32 = 1;
 }
 
 impl Default for Track {
     fn default() -> Self {
         Self {
-            id: 0,
+            id: Track::DEFAULT_ID,
             duration: 0,
             timescale: Track::DEFAULT_TIMESCALE,
             width: 0,
@@ -89,12 +96,12 @@ impl Flags {
     }
 }
 
-pub struct Fmp4 {
+pub struct Fmp4Encoder {
     track: Track,
     sn: u32,
 }
 
-impl Fmp4 {
+impl Fmp4Encoder {
     pub fn new(track: Track) -> Self {
         Self {
             track,
@@ -127,8 +134,6 @@ impl Fmp4 {
 
         self.track.dts += self.track.duration;
         self.sn += 1;
-
-        println!("[wrap_frame] {} => {}", data.len(), buffer.len());
 
         buffer
     }
@@ -472,12 +477,13 @@ fn avc1(track: &Track) -> Vec<u8> {
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, // compressorname
         0x00, 0x18,   // depth = 24
-        0x11, 0x11
+        0xFF, 0xFF
     ];
 
     mp4_box(b"avc1", vec![&bytes, &avcc(track, &sps, &pps), &btrt()])
 }
 
+/// AVCConfigurationBox
 fn avcc(track: &Track, sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let mut bytes = vec![
         0x01, // version
@@ -500,47 +506,8 @@ fn btrt() -> Vec<u8> {
         0x00, 0x2d, 0xc6, 0xc0, // maxBitrate
         0x00, 0x2d, 0xc6, 0xc0
     ];
-    mp4_box(b"avcC", vec![&BTRT])
+    mp4_box(b"btrt", vec![&BTRT])
 }
-
-// fn vp09(width: u16, height: u16) -> Vec<u8> {
-//     let vp09: [u8; 78] = [
-//         0x01, // version 0
-//         0x00, 0x00, 0x00, // flags
-//         0x00, 0x00, // start_ code
-//         0x00, 0x01, // data_reference_index
-//         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-//         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
-//         (width >> 8) as u8, width as u8,
-//         (height >> 8) as u8, height as u8,
-//         0x00, 0x48, 0x00, 0x00, // horizresolution
-//         0x00, 0x48, 0x00, 0x00, // vertresolution
-//         0x00, 0x00, 0x00, 0x00, // reserved
-//         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-//         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-//         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-//         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // compressorname
-//         0x00, 0x01, // frame count
-//         0x00, 0x18, // depth
-//         0xFF, 0xFF,
-//     ];
-//     mp4_box(b"vp09", vec![&vp09, &vpcc()])
-// }
-//
-// fn vpcc() -> Vec<u8> {
-//     const VPCC: [u8; 12] = [
-//         0x01, // version 1
-//         0x00, 0x00, 0x00, // flags
-//         0x00, // profile
-//         0x1F, // level 3.1
-//         0x80, // bitDepth, chromaSubsampling, videoFullRangeFlag
-//         0x02, // colourPrimaries
-//         0x02, // transferCharacteristics
-//         0x02, // matrixCoefficients
-//         0x00, 0x00 // codecIntializationDataSize
-//     ];
-//     mp4_box(b"vpcC", vec![&VPCC])
-// }
 
 /// movie extend
 fn mvex(tracks: &[Track]) -> Vec<u8> {
@@ -576,4 +543,91 @@ fn moov(tracks: &[Track], duration: u32, timescale: u32) -> Vec<u8> {
     payloads.push(&mvex);
 
     mp4_box(b"moov", payloads)
+}
+
+/// 后台保存FLV文件
+#[allow(unused)]
+pub fn save_fmp4_background(stream_name: &str, peer_addr: String) {
+    if let Some(eventbus) = eventbus_map().get(stream_name) {
+        log::warn!("[peer={}] save_fmp4_background, stream_name={}", peer_addr, stream_name);
+        let rx = eventbus.register_receiver();
+        spawn_and_log_error(handle_fmp4_rx(rx, stream_name.to_owned(), peer_addr));
+    }
+}
+
+/// Rtmp流输出到mp4文件
+async fn handle_fmp4_rx(
+    rx: Receiver<RtmpMessage>,
+    stream_name: String,
+    peer_addr: String,
+) -> anyhow::Result<()> {
+    let tmp_dir = "tmp";
+    if smol::fs::read_dir(tmp_dir).await.is_err() {
+        smol::fs::create_dir_all(tmp_dir).await?;
+    }
+
+    let mut file = smol::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("tmp/output.mp4")
+        .await?;
+
+    let meta_data = meta_data_map()
+        .get(&stream_name)
+        .map(|it| it.value().clone())
+        .ok_or_else(|| anyhow::anyhow!(format!("not found meta_data, stream={}", stream_name)))?;
+
+    let video_header = video_header_map()
+        .get(&stream_name)
+        .map(|it| it.value().clone())
+        .ok_or_else(|| anyhow::anyhow!(format!("not found meta_data, stream={}", stream_name)))?;
+
+    let mut sps_list = vec![];
+    let mut pps_list = vec![];
+    let pioneer_nalus = Nalu::from_rtmp_message(&video_header);
+    for nalu in pioneer_nalus {
+        let bytes = (&nalu.to_avcc_format()[4..]).to_vec();
+        match nalu.get_nal_unit_type() {
+            Nalu::UNIT_TYPE_SPS => sps_list.push(bytes),
+            Nalu::UNIT_TYPE_PPS => pps_list.push(bytes),
+            _ => {}
+        }
+    }
+
+    log::info!("[peer={}], sps={:?}, pps={:?}", peer_addr, sps_list, pps_list);
+    let mut fmp4_encoder = Fmp4Encoder::new(Track {
+        duration: (Track::DEFAULT_TIMESCALE as f64 / meta_data.frame_rate) as _,
+        timescale: Track::DEFAULT_TIMESCALE,
+        width: meta_data.width as _,
+        height: meta_data.height as _,
+        sps_list,
+        pps_list,
+        ..Default::default()
+    });
+
+    // send video header
+    let header = fmp4_encoder.init_segment();
+    file.write_all(&header).await?;
+
+    let mut found_key_frame = false;
+    while let Ok(msg) = rx.recv().await {
+        let nalus = Nalu::from_rtmp_message(&msg);
+        for nalu in nalus {
+            if !found_key_frame {
+                if nalu.is_key_frame {
+                    found_key_frame = true;
+                } else {
+                    continue;
+                }
+            }
+
+            let bytes = fmp4_encoder.wrap_frame(&nalu.to_avcc_format(), nalu.is_key_frame);
+            file.write_all(&bytes).await?;
+        }
+        file.flush().await?
+    }
+
+    log::warn!("[peer={}][handle_fmp4_rx] closed, stream_name={}", peer_addr, stream_name);
+    Ok(())
 }

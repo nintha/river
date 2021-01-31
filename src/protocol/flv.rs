@@ -135,10 +135,7 @@ async fn handle_flv_rx(
             file.flush().await?
         }
     }
-    log::warn!(
-        "[peer={}][handle_flv_rx] closed, stream_name={}",
-        peer_addr,
-        stream_name
-    );
+
+    log::warn!("[peer={}][handle_flv_rx] closed, stream_name={}", peer_addr, stream_name);
     Ok(())
 }
