@@ -122,11 +122,11 @@ impl Nalu {
         let mut bytes = vec![0x00, 0x00, 0x00, 0x00];
         for i in 4..origin.len() {
             // remove prevention byte
-            if origin[i - 2] == 0 && origin[i - 1] == 0 && origin[i] == 3 {
-                if i < origin.len() && [0u8, 1, 2, 3].contains(&origin[i + 1]) {
-                    continue;
-                }
-            }
+            // if origin[i - 2] == 0 && origin[i - 1] == 0 && origin[i] == 3 {
+            //    if i < origin.len() && [0u8, 1, 2, 3].contains(&origin[i + 1]) {
+            //        continue;
+            //    }
+            // }
 
             bytes.push(origin[i]);
         }
