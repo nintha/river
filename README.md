@@ -46,7 +46,6 @@ If you are using x264 encoding to push the stream, it is recommended that profil
 ## TODO
 - [ ] PUSH/PULL authentication
 - [ ] support fragmented MP4 output
-- [ ] separate lib.rs and main.rs (now only main.rs)
 
 
 ## FAQ

@@ -14,7 +14,7 @@ use smol::stream;
 use crate::protocol::aac::{AAC, ADTS};
 
 #[allow(unused)]
-pub(crate) async fn run_server(addr: String) -> anyhow::Result<()> {
+pub async fn run_server(addr: String) -> anyhow::Result<()> {
     // Create the event loop and TCP listener we'll accept connections on.
     let try_socket = TcpListener::bind(&addr).await;
     let listener = try_socket.expect("Failed to bind");

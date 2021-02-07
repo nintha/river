@@ -1,18 +1,9 @@
-#[macro_use]
-extern crate num_derive;
-
 use clap::crate_version;
 use clap::Clap;
-use crate::rtmp_server::accept_loop;
-use crate::util::spawn_and_log_error;
+use river::{ws_h264, ws_fmp4, util, http_flv};
+use river::rtmp_server::accept_loop;
+use river::util::spawn_and_log_error;
 
-mod eventbus;
-mod http_flv;
-mod protocol;
-mod rtmp_server;
-mod util;
-mod ws_h264;
-mod ws_fmp4;
 
 #[derive(Clap, Debug)]
 #[clap(version=crate_version!(), author = "Ninthakeey <ninthakeey@hotmail.com>")]

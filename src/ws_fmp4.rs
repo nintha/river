@@ -10,7 +10,7 @@ use crate::rtmp_server::{eventbus_map, video_header_map, meta_data_map};
 use crate::protocol::fmp4::{Fmp4Encoder, Track};
 
 #[allow(unused)]
-pub(crate) async fn run_server(addr: String) -> anyhow::Result<()> {
+pub async fn run_server(addr: String) -> anyhow::Result<()> {
     // Create the event loop and TCP listener we'll accept connections on.
     let try_socket = TcpListener::bind(&addr).await;
     let listener = try_socket.expect("Failed to bind");
