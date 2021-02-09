@@ -8,11 +8,11 @@ use river::util::spawn_and_log_error;
 #[derive(Clap, Debug)]
 #[clap(version=crate_version!(), author = "Ninthakeey <ninthakeey@hotmail.com>")]
 struct Opts {
-    #[clap(long, default_value = "8080")]
+    #[clap(long, default_value = "18000")]
     http_flv_port: u16,
-    #[clap(long, default_value = "8081")]
+    #[clap(long, default_value = "18001")]
     ws_h264_port: u16,
-    #[clap(long, default_value = "8082")]
+    #[clap(long, default_value = "18002")]
     ws_fmp4_port: u16,
     #[clap(long, default_value = "1935")]
     rtmp_port: u16,
