@@ -77,3 +77,7 @@ setInterval(()=>{
 - [视音频数据处理入门](https://blog.csdn.net/leixiaohua1020/article/details/50534369)
 - [rtmp数据封装](https://blog.csdn.net/Jacob_job/article/details/81880445)
 - [视音频编解码学习工程：FLV封装格式分析器](https://blog.csdn.net/leixiaohua1020/article/details/17934487)
+
+Thanks to [Jetbrains](https://www.jetbrains.com/?from=river) for their great IDEs and the free open source license.
+
+![](https://raw.githubusercontent.com/nintha/river/master/doc/jetbrains.webp)
