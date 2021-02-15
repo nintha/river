@@ -80,4 +80,4 @@ setInterval(()=>{
 
 Thanks to [Jetbrains](https://www.jetbrains.com/?from=River) for their great IDEs and the free [open source license](https://jb.gg/OpenSource).
 
-![](https://raw.githubusercontent.com/nintha/river/master/doc/jetbrains.webp)
+![](doc/jetbrains.webp)
