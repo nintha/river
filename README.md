@@ -31,7 +31,7 @@ ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/t
 ### JMuxer
 Playing in the browser with [Jmuxer](https://github.com/samirkumardas/jmuxer).
 
-If pushing stream with x264 codec, recommand profile is baseline 
+If pushing stream with x264 codec, recommended profile is baseline 
 
 If you are using x264 encoding to push the stream, it is recommended that profile=baseline to avoid frequent video jitter. The current local test latency is about 1 second.
 
