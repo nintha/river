@@ -26,7 +26,7 @@ OBS, x264, tune=zerolatency, CBR, perset=veryfast, porfile=baseline
 ```shell
 ffplay -fflags nobuffer -analyzeduration 100000 rtmp://localhost:11935/channel/token
 ```
- `-fflags nobuffer -analyzeduration 100000` could reduce the latency. In my computer, the latency is about 1 second.
+ `-fflags nobuffer -analyzeduration 100000` could reduce the latency. On my computer, the latency is about 1 second.
 
 ### JMuxer
 Playing in the browser with [Jmuxer](https://github.com/samirkumardas/jmuxer).
