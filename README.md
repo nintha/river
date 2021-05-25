@@ -18,7 +18,7 @@ OPTIONS:
 ```
 ## Push
 
-OBS, x264, tune=zerolatency, CBR, perset=veryfast, porfile=baseline
+OBS, x264, tune=zerolatency, CBR, preset=veryfast, profile=baseline
 
 ## Play
 
