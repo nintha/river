@@ -11,10 +11,10 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-        --http-flv-port <http-flv-port>    [default: 8080]
+        --http-flv-port <http-flv-port>    disable if port is 0 [default: 0]
         --rtmp-port <rtmp-port>            [default: 1935]
-        --ws-fmp4-port <ws-fmp4-port>      [default: 8082]
-        --ws-h264-port <ws-h264-port>      [default: 8081]
+        --ws-fmp4-port <ws-fmp4-port>      disable if port is 0 [default: 0]
+        --ws-h264-port <ws-h264-port>      disable if port is 0 [default: 0]
 ```
 ## Push
 
@@ -40,8 +40,9 @@ If you are using x264 encoding to push the stream, it is recommended that profil
 - [x] support audio
 - [x] support HTTP-FLV output
 - [x] support raw H264 stream output
-- [x] Deal with the problem of websocket message backlog
-- [x] Configurable startup parameters (monitoring server port)
+- [x] deal with the problem of websocket message backlog
+- [x] configurable startup parameters (monitoring server port)
+- [x] optional output formats based on the startup parameters
 
 ## TODO
 - [ ] PUSH/PULL authentication
