@@ -47,7 +47,7 @@ If you are using x264 encoding to push the stream, it is recommended that profil
 ## TODO
 - [ ] PUSH/PULL authentication
 - [ ] support fragmented MP4 output
-
+- [ ] web video player with `JMuxer` (ws-h264-port required)
 
 ## FAQ
 
