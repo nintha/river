@@ -11,10 +11,11 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-        --http-flv-port <http-flv-port>    disable if port is 0 [default: 0]
-        --rtmp-port <rtmp-port>            [default: 1935]
-        --ws-fmp4-port <ws-fmp4-port>      disable if port is 0 [default: 0]
-        --ws-h264-port <ws-h264-port>      disable if port is 0 [default: 0]
+        --http-flv-port <http-flv-port>          disabled if port is 0 [default: 0]
+        --http-player-port <http-player-port>    disabled if port is 0 [default: 0]
+        --rtmp-port <rtmp-port>                  [default: 1935]
+        --ws-fmp4-port <ws-fmp4-port>            disabled if port is 0 [default: 0]
+        --ws-h264-port <ws-h264-port>            disabled if port is 0 [default: 0]
 ```
 ## Push
 
@@ -35,6 +36,17 @@ If pushing stream with x264 codec, recommended profile is baseline
 
 If you are using x264 encoding to push the stream, it is recommended that profile=baseline to avoid frequent video jitter. The current local test latency is about 1 second.
 
+**Example:**
+
+1. Run `River`
+```shell
+cargo run -- --http-player-port=8080 --ws-h264-port=18000
+```
+
+2. Push with OBS, x264, tune=zerolatency, CBR, preset=veryfast, profile=baseline
+   
+3. Open your browser http://localhost:8080
+
 ## Completed
 - [x] support custom width and height
 - [x] support audio
@@ -43,11 +55,11 @@ If you are using x264 encoding to push the stream, it is recommended that profil
 - [x] deal with the problem of websocket message backlog
 - [x] configurable startup parameters (monitoring server port)
 - [x] optional output formats based on the startup parameters
+- [x] web video player with `JMuxer` (ws-h264-port required)
 
 ## TODO
 - [ ] PUSH/PULL authentication
 - [ ] support fragmented MP4 output
-- [ ] web video player with `JMuxer` (ws-h264-port required)
 
 ## FAQ
 

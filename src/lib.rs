@@ -3,6 +3,7 @@ extern crate num_derive;
 
 mod eventbus;
 pub mod http_flv;
+pub mod http_player;
 pub mod protocol;
 pub mod rtmp_server;
 pub mod util;

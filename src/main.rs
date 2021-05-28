@@ -1,6 +1,6 @@
 use clap::crate_version;
 use clap::Clap;
-use river::{ws_h264, ws_fmp4, util, http_flv};
+use river::{ws_h264, ws_fmp4, util, http_flv, http_player};
 use river::rtmp_server::accept_loop;
 use river::util::spawn_and_log_error;
 
@@ -8,6 +8,8 @@ use river::util::spawn_and_log_error;
 #[derive(Clap, Debug)]
 #[clap(version = crate_version ! (), author = "Ninthakeey <ninthakeey@hotmail.com>")]
 struct Opts {
+    #[clap(long, default_value = "0", about = "disabled if port is 0")]
+    http_player_port: u16,
     #[clap(long, default_value = "0", about = "disabled if port is 0")]
     http_flv_port: u16,
     #[clap(long, default_value = "0", about = "disabled if port is 0")]
@@ -25,6 +27,12 @@ fn main() -> anyhow::Result<()> {
     let opts: Opts = Opts::parse();
     log::info!("{:?}", &opts);
 
+    let player_html = include_str!("../static/player.html");
+    let player_html = player_html.replace("{/*$INJECTED_CONTEXT*/}", &format!("{{port: {}}}", opts.ws_h264_port));
+
+    if opts.http_player_port > 0 {
+        spawn_and_log_error(http_player::run_server(format!("0.0.0.0:{}", opts.http_player_port), player_html));
+    }
     if opts.http_flv_port > 0 {
         spawn_and_log_error(http_flv::run_server(format!("0.0.0.0:{}", opts.http_flv_port)));
     }
