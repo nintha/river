@@ -45,7 +45,7 @@
 
     $(function main() {
         jmuxer = new JMuxer({
-            flushingTime: 100,
+            flushingTime: 50,
             fps: 30,
             node: 'player',
             mode: 'both', /* available values are: both, audio and video */
@@ -103,9 +103,9 @@
     function forward_latest_frame(video) {
         if (video && video.buffered && video.buffered.end(0)) {
             let latest = video.buffered.end(0);
-            if (latest - video.currentTime > 0.3) {
+            console.log(`[forward_latest_frame] latest=${latest}, video.buffered.length=${video.buffered.length}`);
+            if (latest - video.currentTime > 0.2) {
                 video.currentTime = latest;
-                console.log(`[forward_latest_frame] latest=${latest}`);
             }
         }
     }

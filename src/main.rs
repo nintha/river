@@ -9,10 +9,10 @@ use river::util::spawn_and_log_error;
 #[clap(version = crate_version ! (), author = "Ninthakeey <ninthakeey@hotmail.com>")]
 struct Opts {
     #[clap(long, default_value = "0", about = "disabled if port is 0")]
-    http_player_port: u16,
-    #[clap(long, default_value = "0", about = "disabled if port is 0")]
     http_flv_port: u16,
-    #[clap(long, default_value = "0", about = "disabled if port is 0")]
+    #[clap(long, default_value = "18000", about = "disabled if port is 0")]
+    http_player_port: u16,
+    #[clap(long, default_value = "18001", about = "disabled if port is 0")]
     ws_h264_port: u16,
     #[clap(long, default_value = "0", about = "disabled if port is 0")]
     ws_fmp4_port: u16,

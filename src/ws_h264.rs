@@ -83,9 +83,9 @@ fn rtmp_rx_into_mix_rx(rx: Receiver<RtmpMessage>, stream_name: String) -> impl S
 
             let mut mixes = mixes.into_iter().skip_while(|mix| !mix.is_key_frame()).collect::<Vec<Mix>>();
 
-            // 消息堆积，丢弃非关键帧
-            if rx.len() > 3 {
-                mixes.retain(|x| x.is_key_frame());
+            // 消息堆积，丢弃视频非关键帧
+            if rx.len() > 30 {
+                mixes.retain(|x| x.is_audio() || x.is_key_frame());
             }
 
             if mixes.is_empty() {
